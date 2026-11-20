@@ -32,7 +32,7 @@ class Pretrainer:
         self.train_loader, self.val_loader = build_pretrain_dataloaders(self.cfg.data, self.cfg.training, rank=self.rank, world_size=self.world_size)
         self.optimizer = optim.AdamW(self.model.parameters(), lr=self.cfg.training.lr, weight_decay=self.cfg.training.weight_decay)
         self.use_amp = bool(self.cfg.training.use_amp and self.device.type == "cuda")
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
         total_steps = max(1, len(self.train_loader) * self.cfg.training.epochs)
         warmup_steps = max(1, len(self.train_loader) * self.cfg.training.warmup_epochs)
 

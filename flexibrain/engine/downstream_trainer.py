@@ -45,7 +45,7 @@ class DownstreamTrainer:
         else:
             self.optimizer = optim.AdamW(self.model.parameters(), lr=self.cfg.training.lr, weight_decay=self.cfg.training.weight_decay)
         self.use_amp = bool(self.cfg.training.use_amp and self.device.type == "cuda")
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
         total_steps = max(1, len(self.train_loader) * self.cfg.training.epochs)
         warmup_steps = max(1, len(self.train_loader) * self.cfg.training.warmup_epochs)
 
@@ -107,11 +107,11 @@ class DownstreamTrainer:
             labels_all.extend(labels.cpu().numpy())
         metrics = {
             "loss": total_loss / max(1, num_batches),
-            "accuracy": accuracy_score(labels_all, preds),
-            "precision_macro": precision_score(labels_all, preds, average="macro", zero_division=0),
-            "recall_macro": recall_score(labels_all, preds, average="macro", zero_division=0),
-            "f1_macro": f1_score(labels_all, preds, average="macro", zero_division=0),
-            "f1_weighted": f1_score(labels_all, preds, average="weighted", zero_division=0),
+            "accuracy": float(accuracy_score(labels_all, preds)),
+            "precision_macro": float(precision_score(labels_all, preds, average="macro", zero_division=0)),
+            "recall_macro": float(recall_score(labels_all, preds, average="macro", zero_division=0)),
+            "f1_macro": float(f1_score(labels_all, preds, average="macro", zero_division=0)),
+            "f1_weighted": float(f1_score(labels_all, preds, average="weighted", zero_division=0)),
         }
         if self.rank == 0:
             self.logger.info("%s metrics: %s", split_name, metrics)
@@ -137,7 +137,7 @@ class DownstreamTrainer:
         best_path = os.path.join(self.cfg.logging.checkpoint_dir, "downstream_best.pt")
         if not os.path.exists(best_path):
             return
-        checkpoint = torch.load(best_path, map_location=self.device)
+        checkpoint = torch.load(best_path, map_location=self.device, weights_only=True)
         self.model.load_state_dict(checkpoint["model"])
 
     def _save_test_metrics(self, metrics: Dict[str, float]) -> None:

@@ -2,16 +2,12 @@
 
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import custom_bwd, custom_fwd
+from torch.amp import custom_bwd, custom_fwd
 
 from einops import rearrange, repeat
 
-try:
-    from causal_conv1d import causal_conv1d_fn
-    import causal_conv1d_cuda
-except ImportError:
-    causal_conv1d_fn = None
-    causal_conv1d_cuda = None
+from causal_conv1d import causal_conv1d_fn
+from causal_conv1d.cpp_functions import causal_conv1d_bwd_function, causal_conv1d_fwd_function
 
 import selective_scan_cuda
 
@@ -160,7 +156,7 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
 class MambaInnerFn(torch.autograd.Function):
 
     @staticmethod
-    @custom_fwd
+    @custom_fwd(device_type="cuda")
     def forward(ctx, xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
                 out_proj_weight, out_proj_bias,
                 A, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
@@ -168,24 +164,25 @@ class MambaInnerFn(torch.autograd.Function):
         """
              xz: (batch, dim, seqlen)
         """
-        assert causal_conv1d_cuda is not None, "causal_conv1d_cuda is not available. Please install causal-conv1d."
         assert checkpoint_lvl in [0, 1]
         L = xz.shape[-1]
         delta_rank = delta_proj_weight.shape[1]
         d_state = A.shape[-1] * (1 if not A.is_complex() else 2)
-        if torch.is_autocast_enabled():
-            x_proj_weight = x_proj_weight.to(dtype=torch.get_autocast_gpu_dtype())
-            delta_proj_weight = delta_proj_weight.to(dtype=torch.get_autocast_gpu_dtype())
-            out_proj_weight = out_proj_weight.to(dtype=torch.get_autocast_gpu_dtype())
-            out_proj_bias = (out_proj_bias.to(dtype=torch.get_autocast_gpu_dtype())
+        if torch.is_autocast_enabled("cuda"):
+            x_proj_weight = x_proj_weight.to(dtype=torch.get_autocast_dtype("cuda"))
+            delta_proj_weight = delta_proj_weight.to(dtype=torch.get_autocast_dtype("cuda"))
+            out_proj_weight = out_proj_weight.to(dtype=torch.get_autocast_dtype("cuda"))
+            out_proj_bias = (out_proj_bias.to(dtype=torch.get_autocast_dtype("cuda"))
                              if out_proj_bias is not None else None)
         if xz.stride(-1) != 1:
             xz = xz.contiguous()
         conv1d_weight = rearrange(conv1d_weight, "d 1 w -> d w")
         x, z = xz.chunk(2, dim=1)
         conv1d_bias = conv1d_bias.contiguous() if conv1d_bias is not None else None
-        # Use causal_conv1d_fn wrapper which handles the correct API
-        conv1d_out = causal_conv1d_fn(x, conv1d_weight, conv1d_bias, activation=None)
+        ctx.conv1d_silu = False
+        conv1d_out = causal_conv1d_fwd_function(
+            x, conv1d_weight, conv1d_bias, None, None, None, ctx.conv1d_silu
+        )
         # We're being very careful here about the layout, to avoid extra transposes.
         # We want delta to have d as the slowest moving dimension
         # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
@@ -235,10 +232,9 @@ class MambaInnerFn(torch.autograd.Function):
         return F.linear(rearrange(out_z, "b d l -> b l d"), out_proj_weight, out_proj_bias)
 
     @staticmethod
-    @custom_bwd
+    @custom_bwd(device_type="cuda")
     def backward(ctx, dout):
         # dout: (batch, seqlen, dim)
-        assert causal_conv1d_cuda is not None, "causal_conv1d_cuda is not available. Please install causal-conv1d."
         (xz, conv1d_weight, conv1d_bias, x_dbl, x_proj_weight, delta_proj_weight, out_proj_weight,
          conv1d_out, delta, A, B, C, D, delta_bias, scan_intermediates, out) = ctx.saved_tensors
         L = xz.shape[-1]
@@ -248,8 +244,8 @@ class MambaInnerFn(torch.autograd.Function):
         if dout.stride(-1) != 1:
             dout = dout.contiguous()
         if ctx.checkpoint_lvl == 1:
-            conv1d_out = causal_conv1d_cuda.causal_conv1d_fwd(
-                x, conv1d_weight, conv1d_bias, None, None, None, True
+            conv1d_out = causal_conv1d_fwd_function(
+                x, conv1d_weight, conv1d_bias, None, None, None, ctx.conv1d_silu
             )
             delta = rearrange(delta_proj_weight @ x_dbl[:, :delta_rank].t(),
                               "d (b l) -> b d l", l = L)
@@ -295,8 +291,8 @@ class MambaInnerFn(torch.autograd.Function):
         dconv1d_out = rearrange(dconv1d_out, "d (b l) -> b d l", b=x.shape[0], l=x.shape[-1])
         # The kernel supports passing in a pre-allocated dx (e.g., in case we want to fuse the
         # backward of conv1d with the backward of chunk).
-        dx, dconv1d_weight, dconv1d_bias, *_ = causal_conv1d_cuda.causal_conv1d_bwd(
-            x, conv1d_weight, conv1d_bias, dconv1d_out, None, None, None, dx, False, True
+        _, dconv1d_weight, dconv1d_bias, _ = causal_conv1d_bwd_function(
+            x, conv1d_weight, conv1d_bias, dconv1d_out, None, None, None, dx, False, ctx.conv1d_silu
         )
         dconv1d_bias = dconv1d_bias if conv1d_bias is not None else None
         dconv1d_weight = rearrange(dconv1d_weight, "d w -> d 1 w")
@@ -309,7 +305,7 @@ class MambaInnerFn(torch.autograd.Function):
 class MambaInnerFnNoOutProj(torch.autograd.Function):
 
     @staticmethod
-    @custom_fwd
+    @custom_fwd(device_type="cuda")
     def forward(ctx, xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
                 A, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
                 C_proj_bias=None, delta_softplus=True, checkpoint_lvl=1):
@@ -320,17 +316,18 @@ class MambaInnerFnNoOutProj(torch.autograd.Function):
         L = xz.shape[-1]
         delta_rank = delta_proj_weight.shape[1]
         d_state = A.shape[-1] * (1 if not A.is_complex() else 2)
-        if torch.is_autocast_enabled():
-            x_proj_weight = x_proj_weight.to(dtype=torch.get_autocast_gpu_dtype())
-            delta_proj_weight = delta_proj_weight.to(dtype=torch.get_autocast_gpu_dtype())
+        if torch.is_autocast_enabled("cuda"):
+            x_proj_weight = x_proj_weight.to(dtype=torch.get_autocast_dtype("cuda"))
+            delta_proj_weight = delta_proj_weight.to(dtype=torch.get_autocast_dtype("cuda"))
         if xz.stride(-1) != 1:
             xz = xz.contiguous()
         conv1d_weight = rearrange(conv1d_weight, "d 1 w -> d w")
         x, z = xz.chunk(2, dim=1)
         conv1d_bias = conv1d_bias.contiguous() if conv1d_bias is not None else None
-        # causal_conv1d_fwd signature: (x, weight, bias, activation, final_states_out, out, is_causal)
-        # For compatibility with newer versions, use the function interface instead
-        conv1d_out = causal_conv1d_fn(x, conv1d_weight, conv1d_bias, activation=None)
+        ctx.conv1d_silu = False
+        conv1d_out = causal_conv1d_fwd_function(
+            x, conv1d_weight, conv1d_bias, None, None, None, ctx.conv1d_silu
+        )
         # We're being very careful here about the layout, to avoid extra transposes.
         # We want delta to have d as the slowest moving dimension
         # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
@@ -380,7 +377,7 @@ class MambaInnerFnNoOutProj(torch.autograd.Function):
         return out_z
 
     @staticmethod
-    @custom_bwd
+    @custom_bwd(device_type="cuda")
     def backward(ctx, dout):
         # dout: (batch, seqlen, dim)
         (xz, conv1d_weight, conv1d_bias, x_dbl, x_proj_weight, delta_proj_weight, 
@@ -392,7 +389,9 @@ class MambaInnerFnNoOutProj(torch.autograd.Function):
         if dout.stride(-1) != 1:
             dout = dout.contiguous()
         if ctx.checkpoint_lvl == 1:
-            conv1d_out = causal_conv1d_cuda.causal_conv1d_fwd(x, conv1d_weight, conv1d_bias,None, None, None, True)
+            conv1d_out = causal_conv1d_fwd_function(
+                x, conv1d_weight, conv1d_bias, None, None, None, ctx.conv1d_silu
+            )
             delta = rearrange(delta_proj_weight @ x_dbl[:, :delta_rank].t(),
                               "d (b l) -> b d l", l = L)
         # The kernel supports passing in a pre-allocated dz (e.g., in case we want to fuse the
@@ -434,8 +433,8 @@ class MambaInnerFnNoOutProj(torch.autograd.Function):
         dconv1d_out = rearrange(dconv1d_out, "d (b l) -> b d l", b=x.shape[0], l=x.shape[-1])
         # The kernel supports passing in a pre-allocated dx (e.g., in case we want to fuse the
         # backward of conv1d with the backward of chunk).
-        dx, dconv1d_weight, dconv1d_bias, *_ = causal_conv1d_cuda.causal_conv1d_bwd(
-            x, conv1d_weight, conv1d_bias, dconv1d_out, None, None, None, dx, False, True
+        _, dconv1d_weight, dconv1d_bias, _ = causal_conv1d_bwd_function(
+            x, conv1d_weight, conv1d_bias, dconv1d_out, None, None, None, dx, False, ctx.conv1d_silu
         )
         dconv1d_bias = dconv1d_bias if conv1d_bias is not None else None
         dconv1d_weight = rearrange(dconv1d_weight, "d w -> d 1 w")
@@ -447,7 +446,7 @@ class MambaInnerFnNoOutProj(torch.autograd.Function):
 class BiMambaInnerFn(torch.autograd.Function):
 
     @staticmethod
-    @custom_fwd
+    @custom_fwd(device_type="cuda")
     def forward(ctx, xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
                 out_proj_weight, out_proj_bias,
                 A, A_b, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
@@ -459,18 +458,21 @@ class BiMambaInnerFn(torch.autograd.Function):
         L = xz.shape[-1]
         delta_rank = delta_proj_weight.shape[1]
         d_state = A.shape[-1] * (1 if not A.is_complex() else 2)
-        if torch.is_autocast_enabled():
-            x_proj_weight = x_proj_weight.to(dtype=torch.get_autocast_gpu_dtype())
-            delta_proj_weight = delta_proj_weight.to(dtype=torch.get_autocast_gpu_dtype())
-            out_proj_weight = out_proj_weight.to(dtype=torch.get_autocast_gpu_dtype())
-            out_proj_bias = (out_proj_bias.to(dtype=torch.get_autocast_gpu_dtype())
+        if torch.is_autocast_enabled("cuda"):
+            x_proj_weight = x_proj_weight.to(dtype=torch.get_autocast_dtype("cuda"))
+            delta_proj_weight = delta_proj_weight.to(dtype=torch.get_autocast_dtype("cuda"))
+            out_proj_weight = out_proj_weight.to(dtype=torch.get_autocast_dtype("cuda"))
+            out_proj_bias = (out_proj_bias.to(dtype=torch.get_autocast_dtype("cuda"))
                              if out_proj_bias is not None else None)
         if xz.stride(-1) != 1:
             xz = xz.contiguous()
         conv1d_weight = rearrange(conv1d_weight, "d 1 w -> d w")
         x, z = xz.chunk(2, dim=1)
         conv1d_bias = conv1d_bias.contiguous() if conv1d_bias is not None else None
-        conv1d_out = causal_conv1d_cuda.causal_conv1d_fwd(x, conv1d_weight, conv1d_bias,None, None, None, True)
+        ctx.conv1d_silu = True
+        conv1d_out = causal_conv1d_fwd_function(
+            x, conv1d_weight, conv1d_bias, None, None, None, ctx.conv1d_silu
+        )
         # We're being very careful here about the layout, to avoid extra transposes.
         # We want delta to have d as the slowest moving dimension
         # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
@@ -527,7 +529,7 @@ class BiMambaInnerFn(torch.autograd.Function):
         return F.linear(rearrange(out_z, "b d l -> b l d"), out_proj_weight, out_proj_bias)
 
     @staticmethod
-    @custom_bwd
+    @custom_bwd(device_type="cuda")
     def backward(ctx, dout):
         # dout: (batch, seqlen, dim)
         (xz, conv1d_weight, conv1d_bias, x_dbl, x_proj_weight, delta_proj_weight, out_proj_weight,
@@ -539,7 +541,9 @@ class BiMambaInnerFn(torch.autograd.Function):
         if dout.stride(-1) != 1:
             dout = dout.contiguous()
         if ctx.checkpoint_lvl == 1:
-            conv1d_out = causal_conv1d_cuda.causal_conv1d_fwd(x, conv1d_weight, conv1d_bias, None, None, None, True)
+            conv1d_out = causal_conv1d_fwd_function(
+                x, conv1d_weight, conv1d_bias, None, None, None, ctx.conv1d_silu
+            )
             delta = rearrange(delta_proj_weight @ x_dbl[:, :delta_rank].t(),
                               "d (b l) -> b d l", l = L)
         # The kernel supports passing in a pre-allocated dz (e.g., in case we want to fuse the
@@ -601,8 +605,8 @@ class BiMambaInnerFn(torch.autograd.Function):
         dconv1d_out = rearrange(dconv1d_out, "d (b l) -> b d l", b=x.shape[0], l=x.shape[-1])
         # The kernel supports passing in a pre-allocated dx (e.g., in case we want to fuse the
         # backward of conv1d with the backward of chunk).
-        dx, dconv1d_weight, dconv1d_bias = causal_conv1d_cuda.causal_conv1d_bwd(
-            x, conv1d_weight, conv1d_bias, dconv1d_out, None, dx, True
+        _, dconv1d_weight, dconv1d_bias, _ = causal_conv1d_bwd_function(
+            x, conv1d_weight, conv1d_bias, dconv1d_out, None, None, None, dx, False, ctx.conv1d_silu
         )
         dconv1d_bias = dconv1d_bias if conv1d_bias is not None else None
         dconv1d_weight = rearrange(dconv1d_weight, "d w -> d 1 w")
@@ -649,7 +653,6 @@ def mamba_inner_ref(
     A, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
     C_proj_bias=None, delta_softplus=True
 ):
-    assert causal_conv1d_fn is not None, "causal_conv1d_fn is not available. Please install causal-conv1d."
     L = xz.shape[-1]
     delta_rank = delta_proj_weight.shape[1]
     d_state = A.shape[-1] * (1 if not A.is_complex() else 2)
@@ -690,7 +693,7 @@ def bimamba_inner_ref(
     delta_rank = delta_proj_weight.shape[1]
     d_state = A.shape[-1] * (1 if not A.is_complex() else 2)
     x, z = xz.chunk(2, dim=1)
-    x = causal_conv1d_fn(x, rearrange(conv1d_weight, "d 1 w -> d w"), conv1d_bias, "silu")
+    x = causal_conv1d_fn(x, rearrange(conv1d_weight, "d 1 w -> d w"), conv1d_bias, activation="silu")
     # We're being very careful here about the layout, to avoid extra transposes.
     # We want delta to have d as the slowest moving dimension
     # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.

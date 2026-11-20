@@ -11,18 +11,15 @@ from packaging import version
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-from torch.cuda.amp import custom_bwd, custom_fwd
+from torch.amp import custom_bwd, custom_fwd
 
 import triton
 import triton.language as tl
 
 from einops import rearrange, repeat
 
-try:
-    from causal_conv1d import causal_conv1d_fn
-    import causal_conv1d_cuda
-except ImportError:
-    causal_conv1d_fn, causal_conv1d_cuda = None, None
+from causal_conv1d import causal_conv1d_fn
+from causal_conv1d.cpp_functions import causal_conv1d_bwd_function, causal_conv1d_fwd_function
 
 from .ssd_bmm import _bmm_chunk_fwd, _bmm_chunk_bwd
 from .ssd_chunk_state import _chunk_cumsum_fwd, _chunk_cumsum_bwd
@@ -656,7 +653,7 @@ def ssd_selective_scan(x, dt, A, B, C, D=None, z=None, dt_bias=None, dt_softplus
     Return:
         out: (batch, seqlen, nheads, headdim)
     """
-    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+    from ..selective_scan_interface import selective_scan_fn
 
     batch, seqlen, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
@@ -734,10 +731,15 @@ def mamba_conv1d_scan_ref(xBC, conv1d_weight, conv1d_bias, dt, A, chunk_size, D=
     return rearrange(out, "b s h p -> b s (h p)")
 
 
+def _conv1d_aligned(x):
+    # The channels-last CUDA kernel needs batch and sequence strides aligned to 8 elements.
+    return x.stride(0) % 8 == 0 and x.stride(1) % 8 == 0
+
+
 class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
 
     @staticmethod
-    @custom_fwd
+    @custom_fwd(device_type="cuda")
     def forward(ctx, zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu",
                 rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None,
                 ngroups=1, norm_before_gate=True):
@@ -758,10 +760,12 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         assert A.shape == (nheads,)
         zx0, z, xBC, dt = torch.split(zxbcdt, [2 * d_nonssm, dim, dim + ngroups * dstate * 2, nheads], dim=-1)
         seq_idx = seq_idx.contiguous() if seq_idx is not None else None
-        # print('xCB shape:', xBC.shape)
+        xBC = xBC if _conv1d_aligned(xBC) else xBC.contiguous()
         xBC_conv = rearrange(
-            causal_conv1d_cuda.causal_conv1d_fwd(rearrange(xBC, "b s d -> b d s"),
-                                                 conv1d_weight, conv1d_bias, seq_idx, None, None, activation in ["silu", "swish"]),
+            causal_conv1d_fwd_function(
+                xBC.transpose(1, 2), conv1d_weight, conv1d_bias,
+                seq_idx, None, None, activation in ["silu", "swish"],
+            ),
             "b d s -> b s d"
         )
         x, B, C = torch.split(xBC_conv, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
@@ -796,8 +800,8 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
                 out = out01
         ctx.outproj_weight_dtype = outproj_weight.dtype if outproj_weight is not None else None
         if outproj_weight is not None:
-            if torch.is_autocast_enabled():
-                dtype = torch.get_autocast_gpu_dtype()
+            if torch.is_autocast_enabled("cuda"):
+                dtype = torch.get_autocast_dtype("cuda")
                 out, outproj_weight = out.to(dtype), outproj_weight.to(dtype)
                 outproj_bias = outproj_bias.to(dtype) if outproj_bias is not None else None
             out = F.linear(out, outproj_weight, outproj_bias)
@@ -816,7 +820,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         return out if not return_final_states else (out, final_states)
 
     @staticmethod
-    @custom_bwd
+    @custom_bwd(device_type="cuda")
     def backward(ctx, dout, *args):
         zxbcdt, conv1d_weight, conv1d_bias, out, A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias = ctx.saved_tensors
         dfinal_states = args[0] if ctx.return_final_states else None
@@ -832,10 +836,13 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             out_recompute = torch.empty(*out.shape[:2], d_nonssm + dim, device=out.device, dtype=out.dtype)
             out0_recompute, out1_recompute = out_recompute.split([d_nonssm, dim], dim=-1)
         zx0, z, xBC, dt = torch.split(zxbcdt, [2 * d_nonssm, dim, dim + 2 * ctx.ngroups * dstate, nheads], dim=-1)
+        xBC = xBC if _conv1d_aligned(xBC) else xBC.contiguous()
         # Recompute x, B, C
         xBC_conv = rearrange(
-            causal_conv1d_cuda.causal_conv1d_fwd(rearrange(xBC, "b s d -> b d s"),
-                                                 conv1d_weight, conv1d_bias, seq_idx, None, None, ctx.activation in ["silu", "swish"]),
+            causal_conv1d_fwd_function(
+                xBC.transpose(1, 2), conv1d_weight, conv1d_bias,
+                seq_idx, None, None, ctx.activation in ["silu", "swish"],
+            ),
             "b d s -> b s d"
         )
         x, B, C = torch.split(xBC_conv, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
@@ -883,12 +890,13 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             doutproj_bias = dout_og.sum(dim=(0, 1)) if outproj_bias is not None else None
         else:
             doutproj_weight, doutproj_bias = None, None
-        dxBC_given = rearrange(dxBC_given, "b s d -> b d s")
-        dxBC_given, dweight, dbias, *_ = causal_conv1d_cuda.causal_conv1d_bwd(
-            rearrange(xBC, "b s d -> b d s"), conv1d_weight, conv1d_bias,
-            rearrange(dxBC, "b s d -> b d s"), seq_idx, None, None, dxBC_given, False, ctx.activation in ["silu", "swish"]
+        dxBC_buffer = dxBC_given.transpose(1, 2) if _conv1d_aligned(dxBC_given) else None
+        dxBC_result, dweight, dbias, _ = causal_conv1d_bwd_function(
+            xBC.transpose(1, 2), conv1d_weight, conv1d_bias, dxBC.transpose(1, 2),
+            seq_idx, None, None, dxBC_buffer, False, ctx.activation in ["silu", "swish"],
         )
-        dxBC_given = rearrange(dxBC_given, "b d s -> b s d")
+        if dxBC_buffer is None:
+            dxBC_given.copy_(dxBC_result.transpose(1, 2))
         return dzxbcdt, dweight, dbias, ddt_bias, dA, dD, None, dinitial_states, None, None, None, None, drmsnorm_weight, None, doutproj_weight, doutproj_bias, None, None, None
 
 # @torch.compile(options={"triton.cudagraphs": True})

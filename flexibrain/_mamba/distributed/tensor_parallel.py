@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch.cuda.amp import custom_bwd, custom_fwd
+from torch.amp import custom_bwd, custom_fwd
 from torch.distributed import ProcessGroup
 
 from einops import rearrange
@@ -22,7 +22,7 @@ from .distributed_utils import (
 
 class ParallelLinearFunc(torch.autograd.Function):
     @staticmethod
-    @custom_fwd
+    @custom_fwd(device_type="cuda")
     def forward(ctx, x, weight, bias, process_group=None, sequence_parallel=True):
         """
         If process_group is not None and sequence_parallel=True, we're doing Tensor Parallel
@@ -32,8 +32,8 @@ class ParallelLinearFunc(torch.autograd.Function):
         ctx.process_group = process_group
         ctx.sequence_parallel = sequence_parallel
 
-        if torch.is_autocast_enabled():
-            x = x.to(dtype=torch.get_autocast_gpu_dtype())
+        if torch.is_autocast_enabled("cuda"):
+            x = x.to(dtype=torch.get_autocast_dtype("cuda"))
         x = x.contiguous()
         if process_group is not None and sequence_parallel:
             # We want to kick off the all_gather early, before weight dtype conversion
@@ -41,9 +41,9 @@ class ParallelLinearFunc(torch.autograd.Function):
         else:
             total_x = x
 
-        if torch.is_autocast_enabled():
-            weight = weight.to(dtype=torch.get_autocast_gpu_dtype())
-            bias = bias.to(dtype=torch.get_autocast_gpu_dtype()) if bias is not None else None
+        if torch.is_autocast_enabled("cuda"):
+            weight = weight.to(dtype=torch.get_autocast_dtype("cuda"))
+            bias = bias.to(dtype=torch.get_autocast_dtype("cuda")) if bias is not None else None
         weight = weight.contiguous()
         if process_group is not None and sequence_parallel:
             handle_x.wait()
@@ -58,7 +58,7 @@ class ParallelLinearFunc(torch.autograd.Function):
         return output
 
     @staticmethod
-    @custom_bwd
+    @custom_bwd(device_type="cuda")
     def backward(ctx, grad_output):
         grad_output = grad_output.contiguous()
         process_group = ctx.process_group

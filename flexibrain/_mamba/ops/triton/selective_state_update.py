@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
 
 from einops import rearrange, repeat
 
@@ -83,7 +84,7 @@ def _selective_scan_update_kernel(
         if HAS_DT_BIAS:
             dt += tl.load(dt_bias_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
         if DT_SOFTPLUS:
-            dt = tl.where(dt <= 20.0, tl.math.log1p(tl.exp(dt)), dt)
+            dt = tl.where(dt <= 20.0, libdevice.log1p(tl.exp(dt)), dt)
         A = tl.load(A_ptrs, mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate), other=0.0).to(tl.float32)
         dA = tl.exp(A * dt[:, None])
     else:
@@ -91,7 +92,7 @@ def _selective_scan_update_kernel(
         if HAS_DT_BIAS:
             dt += tl.load(dt_bias_ptr).to(tl.float32)
         if DT_SOFTPLUS:
-            dt = tl.where(dt <= 20.0, tl.math.log1p(tl.exp(dt)), dt)
+            dt = tl.where(dt <= 20.0, libdevice.log1p(tl.exp(dt)), dt)
         A = tl.load(A_ptr).to(tl.float32)
         dA = tl.exp(A * dt)  # scalar, not a matrix
 

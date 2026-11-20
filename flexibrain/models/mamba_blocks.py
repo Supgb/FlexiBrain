@@ -16,12 +16,12 @@ from typing import Optional
 import torch
 import torch.nn as nn
 from torch import Tensor
-from timm.models.layers import DropPath
+from timm.layers import DropPath
 
-from mamba_ssm.modules.mamba_simple import Mamba
-from mamba_ssm.modules.mamba2 import Mamba2
-from mamba_ssm.modules.mha import MHA
-from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn
+from flexibrain._mamba.modules.mamba_simple import Mamba
+from flexibrain._mamba.modules.mamba2 import Mamba2
+from flexibrain._mamba.modules.mha import MHA
+from flexibrain._mamba.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn
 
 
 class Block(nn.Module):

@@ -15,7 +15,7 @@ from functools import partial
 import torch
 import torch.nn as nn
 
-from timm.models.vision_transformer import DropPath
+from timm.layers import DropPath
 
 
 from flexibrain.models.mamba_blocks import RMSNorm, create_block, _init_weights, layer_norm_fn, rms_norm_fn

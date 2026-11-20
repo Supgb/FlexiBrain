@@ -19,19 +19,17 @@ Flexibrain is a voxel-level fMRI representation learning framework for pretraini
 
 ## Installation
 
-The code was tested on l40 with Python 3.10, PyTorch 2.1.2, CUDA 12.1, `causal-conv1d`, `mamba-ssm`, and `flash-attn`.
+The locked training environment targets Linux x86-64, Python 3.10, and an NVIDIA GPU with a driver that supports CUDA 12.8. It uses PyTorch 2.7.1 and prebuilt Mamba and causal convolution wheels with Blackwell support (including the RTX 5090).
 
 ```bash
-conda create -n flexibrain python=3.10
-conda activate flexibrain
-pip install -r requirements.txt
-pip install -e .
+uv sync --locked --python 3.10 --extra cuda --extra preprocess
+source .venv/bin/activate
 ```
 
-Check the CLI:
+Check CUDA and the CLI:
 
 ```bash
-python -m flexibrain --help
+python -c 'import torch; print(torch.cuda.get_device_name()); print(torch.ones(1, device="cuda"))'
 python -m flexibrain pretrain --help
 python -m flexibrain downstream --help
 ```
