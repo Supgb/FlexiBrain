@@ -34,6 +34,7 @@ def _add_common(parser):
     parser.add_argument("--world-size", type=int, default=None)
     parser.add_argument("--use-amp", action="store_true", default=None)
     parser.add_argument("--no-use-amp", dest="use_amp", action="store_false")
+    parser.add_argument("--amp-dtype", choices=["float16", "bfloat16"], default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.set_defaults(use_amp=None)
 
@@ -50,6 +51,7 @@ def _add_model(parser):
     parser.add_argument("--mixer-type", default=None)
     parser.add_argument("--momentum", type=float, default=None)
     parser.add_argument("--final-momentum", type=float, default=None)
+    parser.add_argument("--ema-schedule", choices=["linear", "cosine"], default=None)
 
 
 def apply_common(cfg, args):
@@ -67,6 +69,8 @@ def apply_common(cfg, args):
         cfg.data.default_tr = args.default_tr
     if args.use_amp is not None:
         cfg.training.use_amp = args.use_amp
+    if args.amp_dtype is not None:
+        cfg.training.amp_dtype = args.amp_dtype
     if args.log_interval is not None:
         cfg.logging.log_interval = args.log_interval
     if args.checkpoint_dir is not None:
@@ -76,7 +80,7 @@ def apply_common(cfg, args):
 
 
 def apply_model(cfg, args):
-    for key in ["embed_dim", "depth", "predictor_depth", "drop_path_rate", "bimamba_type", "if_bimamba", "if_devide_out", "mixer_type", "momentum", "final_momentum"]:
+    for key in ["embed_dim", "depth", "predictor_depth", "drop_path_rate", "bimamba_type", "if_bimamba", "if_devide_out", "mixer_type", "momentum", "final_momentum", "ema_schedule"]:
         value = getattr(args, key, None)
         if value is not None:
             setattr(cfg.model, key, value)
@@ -107,6 +111,7 @@ def parse_args():
     downstream.add_argument("--freeze-backbone", action="store_true")
     downstream.add_argument("--lr-backbone", type=float, default=None)
     downstream.add_argument("--lr-head", type=float, default=None)
+    downstream.add_argument("--selection-metric", choices=["val_auroc", "val_loss", "f1_macro", "f1_weighted"], default=None)
     return parser.parse_args()
 
 
@@ -138,6 +143,8 @@ def main():
             cfg.training.lr_backbone = args.lr_backbone
         if args.lr_head is not None:
             cfg.training.lr_head = args.lr_head
+        if args.selection_metric is not None:
+            cfg.training.selection_metric = args.selection_metric
         if args.pretrain_checkpoint is not None:
             cfg.pretrain_checkpoint = args.pretrain_checkpoint
         if args.from_scratch:

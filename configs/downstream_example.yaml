@@ -23,7 +23,7 @@ data:
   label_column: Group_idx
   label_mode: multiclass
   path_id_mode: auto
-  batch_size: 8
+  batch_size: 4
   num_workers: 8
   T_prime: 30
   tau_seconds: 6.0
@@ -31,11 +31,12 @@ data:
 training:
   epochs: 30
   lr: 1.0e-5
-  lr_backbone: 6.0e-6
-  lr_head: 6.0e-5
+  lr_backbone: null
+  lr_head: null
   weight_decay: 0.05
   warmup_epochs: 2
-  grad_accumulation_steps: 2
+  selection_metric: val_auroc
+  grad_accumulation_steps: 4
   grad_clip: 1.0
   seed: 42
   use_amp: true

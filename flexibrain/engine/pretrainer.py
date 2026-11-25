@@ -30,20 +30,26 @@ class Pretrainer:
         set_seed(self.cfg.training.seed)
         self.model = build_pretrain_model(self.cfg.model, self.device)
         self.train_loader, self.val_loader = build_pretrain_dataloaders(self.cfg.data, self.cfg.training, rank=self.rank, world_size=self.world_size)
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=self.cfg.training.lr, weight_decay=self.cfg.training.weight_decay)
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=self.cfg.training.lr,
+            betas=(0.9, 0.999),
+            weight_decay=self.cfg.training.weight_decay,
+        )
         self.use_amp = bool(self.cfg.training.use_amp and self.device.type == "cuda")
-        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
-        total_steps = max(1, len(self.train_loader) * self.cfg.training.epochs)
-        warmup_steps = max(1, len(self.train_loader) * self.cfg.training.warmup_epochs)
+        self.amp_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[self.cfg.training.amp_dtype]
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp and self.amp_dtype == torch.float16)
+        accum = max(1, int(self.cfg.training.grad_accumulation_steps))
+        steps_per_epoch = max(1, math.ceil(len(self.train_loader) / accum))
+        total_steps = max(1, steps_per_epoch * self.cfg.training.epochs)
+        warmup_steps = max(0, steps_per_epoch * self.cfg.training.warmup_epochs)
 
         def lr_lambda(step):
-            if step < warmup_steps:
-                return step / warmup_steps
-            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-            cycle_progress = (progress * 4) % 1.0
-            if cycle_progress < 0.8:
-                return 0.5 * (1 + math.cos(math.pi * cycle_progress / 0.8))
-            return 0.0
+            if warmup_steps > 0 and step < warmup_steps:
+                return (step + 1) / warmup_steps
+            decay_steps = max(1, total_steps - warmup_steps)
+            progress = min(1.0, max(0.0, (step - warmup_steps) / decay_steps))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
 
         self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
         return self
@@ -52,22 +58,31 @@ class Pretrainer:
         if self.cfg.training.grad_clip > 0:
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.training.grad_clip)
+        scale_before = self.scaler.get_scale() if self.use_amp else None
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.optimizer.zero_grad(set_to_none=True)
-        update_ema(self.model, momentum)
-        self.scheduler.step()
+        stepped = (not self.use_amp) or (self.scaler.get_scale() >= scale_before)
+        if stepped:
+            update_ema(self.model, momentum)
+            self.scheduler.step()
 
     def train_one_epoch(self, epoch: int) -> float:
         self.model.train()
         total_loss = 0.0
         num_batches = 0
-        accumulation_steps = self.cfg.training.grad_accumulation_steps
-        momentum = get_dynamic_momentum(epoch, self.cfg.training.epochs, self.cfg.model.momentum, self.cfg.model.final_momentum)
+        accumulation_steps = max(1, int(self.cfg.training.grad_accumulation_steps))
+        momentum = get_dynamic_momentum(
+            epoch,
+            self.cfg.training.epochs,
+            self.cfg.model.momentum,
+            self.cfg.model.final_momentum,
+            schedule=self.cfg.model.ema_schedule,
+        )
         self.optimizer.zero_grad(set_to_none=True)
         for batch_idx, batch in enumerate(self.train_loader):
             x, meta, orig_Ts, affines = prepare_batch_data(batch, self.device)
-            with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.use_amp):
+            with torch.autocast(device_type=self.device.type, dtype=getattr(self, "amp_dtype", torch.float16), enabled=self.use_amp):
                 loss, _, _, _ = self.model(x, mask_ratio=self.cfg.training.mask_ratio, meta=meta, orig_Ts=orig_Ts, affines=affines)
             self.scaler.scale(loss / accumulation_steps).backward()
             total_loss += float(loss.item())
@@ -75,7 +90,17 @@ class Pretrainer:
             if (batch_idx + 1) % accumulation_steps == 0:
                 self._optimizer_step(momentum)
             if self.rank == 0 and (batch_idx + 1) % self.cfg.logging.log_interval == 0:
-                self.logger.info("Epoch %d [%d/%d] loss=%.6f avg=%.6f momentum=%.6f", epoch + 1, batch_idx + 1, len(self.train_loader), loss.item(), total_loss / num_batches, momentum)
+                current_lr = self.optimizer.param_groups[0]["lr"]
+                self.logger.info(
+                    "Epoch %d [%d/%d] loss=%.6f avg=%.6f lr=%.3e momentum=%.6f",
+                    epoch + 1,
+                    batch_idx + 1,
+                    len(self.train_loader),
+                    loss.item(),
+                    total_loss / num_batches,
+                    current_lr,
+                    momentum,
+                )
         if num_batches % accumulation_steps != 0:
             self._optimizer_step(momentum)
         return total_loss / max(1, num_batches)
@@ -87,7 +112,7 @@ class Pretrainer:
         num_batches = 0
         for batch in self.val_loader:
             x, meta, orig_Ts, affines = prepare_batch_data(batch, self.device)
-            with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.use_amp):
+            with torch.autocast(device_type=self.device.type, dtype=getattr(self, "amp_dtype", torch.float16), enabled=self.use_amp):
                 loss, _, _, _ = self.model(x, mask_ratio=self.cfg.training.mask_ratio, meta=meta, orig_Ts=orig_Ts, affines=affines)
             total_loss += float(loss.item())
             num_batches += 1
@@ -105,6 +130,7 @@ class Pretrainer:
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict(),
             "val_loss": val_loss,
             "best_loss": best_loss,
             "config": vars(self.cfg.model),
@@ -113,13 +139,30 @@ class Pretrainer:
         if is_best:
             torch.save(payload, os.path.join(self.cfg.logging.checkpoint_dir, "checkpoint_best.pt"))
 
+    def _resume(self) -> tuple[int, float]:
+        path = self.cfg.logging.resume
+        checkpoint = torch.load(path, map_location=self.device, weights_only=True)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        if "scaler_state_dict" in checkpoint:
+            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        next_epoch = int(checkpoint["epoch"]) + 1
+        best_loss = float(checkpoint["best_loss"])
+        if self.rank == 0:
+            self.logger.info("Resumed pretrain from %s at epoch %d best_loss=%.6f", path, next_epoch + 1, best_loss)
+        return next_epoch, best_loss
+
     def fit(self):
         self.build()
         if self.rank == 0:
             self.logger.info("Starting pretrain on %s", self.device)
             self.logger.info("Train size=%d Val size=%d", len(self.train_loader.dataset), len(self.val_loader.dataset))
+        start_epoch = 0
         best_loss = float("inf")
-        for epoch in range(self.cfg.training.epochs):
+        if self.cfg.logging.resume:
+            start_epoch, best_loss = self._resume()
+        for epoch in range(start_epoch, self.cfg.training.epochs):
             if hasattr(self.train_loader.sampler, "set_epoch"):
                 self.train_loader.sampler.set_epoch(epoch)
             train_loss = self.train_one_epoch(epoch)

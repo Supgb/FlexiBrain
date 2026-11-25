@@ -1,0 +1,35 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Pretraining",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "flexibrain",
+            "args": [
+                "pretrain",
+                "--config",
+                "configs/pretrain_example.yaml"
+            ],
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Downstream evaluation",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "flexibrain",
+            "args": [
+                "downstream",
+                "--config",
+                "configs/downstream_example.yaml"
+            ],
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ]
+}

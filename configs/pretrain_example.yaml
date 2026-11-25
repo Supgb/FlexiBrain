@@ -9,6 +9,7 @@ model:
   mixer_type: mamba
   momentum: 0.996
   final_momentum: 0.9999
+  ema_schedule: linear
   norm_target: true
 data:
   train_list: data/lists/pretrain_train.txt
@@ -19,7 +20,7 @@ data:
   tau_seconds: 6.0
   default_tr: null
 training:
-  epochs: 30
+  epochs: 100
   lr: 5.0e-4
   weight_decay: 0.05
   warmup_epochs: 3

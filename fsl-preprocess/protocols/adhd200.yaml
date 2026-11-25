@@ -1,0 +1,23 @@
+dataset: adhd200
+default_scheme: null
+default_drop_initial_trs: 0
+description: >
+  Verified slice acquisition protocols for ADHD-200 sites (used when BIDS
+  SliceTiming sidecars are absent or do not match the volume slice count).
+  All sites except KKI (Philips sequential ascending) use Siemens interleaved
+  ascending (Transversal F >> H) acquisition.
+sites:
+  # Philips 3T sequential ascending
+  KKI: seq_asc
+
+  # Siemens 3T/1.5T interleaved ascending (Transversal F >> H)
+  NYU: siemens_interleaved_fh
+  NeuroIMAGE: siemens_interleaved_fh
+  OHSU: siemens_interleaved_fh
+  Peking_1: siemens_interleaved_fh
+  Peking_2: siemens_interleaved_fh
+  Peking_3: siemens_interleaved_fh
+  Peking: siemens_interleaved_fh
+  Pittsburgh: siemens_interleaved_fh
+  WashU: siemens_interleaved_fh
+  Brown: siemens_interleaved_fh

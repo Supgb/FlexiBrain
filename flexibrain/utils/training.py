@@ -25,14 +25,28 @@ def update_ema(model: nn.Module, momentum: float) -> None:
         model.module.update_target_encoder(m=momentum)
 
 
-def get_dynamic_momentum(epoch: int, total_epochs: int, base_momentum: float = 0.996, final_momentum: float = 0.9999) -> float:
+def get_dynamic_momentum(
+    epoch: int,
+    total_epochs: int,
+    base_momentum: float = 0.996,
+    final_momentum: float = 0.9999,
+    schedule: str = "linear",
+) -> float:
     """
     Calculate dynamic momentum for EMA.
 
-    Momentum increases from base_momentum to final_momentum over training.
-    This helps stabilize training in later epochs.
+    Momentum increases from base_momentum to final_momentum over training
+    using either a linear or cosine schedule.
     """
-    progress = epoch / total_epochs
-    # Cosine annealing: start at base, end at final
-    momentum = final_momentum - (final_momentum - base_momentum) * 0.5 * (1 + np.cos(np.pi * progress))
-    return momentum
+    if total_epochs <= 1:
+        progress = 0.0
+    else:
+        progress = min(1.0, max(0.0, epoch / (total_epochs - 1)))
+
+    if schedule == "linear":
+        momentum = base_momentum + (final_momentum - base_momentum) * progress
+    elif schedule == "cosine":
+        momentum = final_momentum - (final_momentum - base_momentum) * 0.5 * (1 + np.cos(np.pi * progress))
+    else:
+        raise ValueError(f"Unsupported EMA schedule: {schedule!r}. Expected 'linear' or 'cosine'.")
+    return float(momentum)

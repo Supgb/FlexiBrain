@@ -23,6 +23,7 @@ class ModelConfig:
     if_devide_out: bool = True
     momentum: float = 0.996
     final_momentum: float = 0.9999
+    ema_schedule: str = "linear"
     norm_target: bool = True
     num_heads: int = 8
     mlp_ratio: float = 4.0
@@ -51,6 +52,7 @@ class DataConfig:
     path_id_mode: str = "auto"
     normal_label: int = 2
     batch_size: int = 8
+    eval_batch_size: Optional[int] = None
     num_workers: int = 8
     memory_map: bool = True
     T_prime: int = 30
@@ -66,11 +68,13 @@ class TrainingConfig:
     lr_head: Optional[float] = None
     weight_decay: float = 0.05
     warmup_epochs: int = 2
+    selection_metric: str = "val_auroc"
     mask_ratio: float = 0.65
     grad_clip: float = 1.0
     grad_accumulation_steps: int = 1
     seed: int = 42
     use_amp: bool = False
+    amp_dtype: str = "float16"
     local_rank: int = 0
     world_size: int = 1
 
@@ -123,8 +127,8 @@ def apply_checkpoint_config(model_cfg: ModelConfig, checkpoint_config: dict) -> 
     keys = [
         "model_type", "embed_dim", "depth", "predictor_depth", "drop_path_rate",
         "rms_norm", "fused_add_norm", "residual_in_fp32", "bimamba_type",
-        "if_bimamba", "mixer_type", "if_devide_out", "momentum", "norm_target",
-        "num_heads", "mlp_ratio",
+        "if_bimamba", "mixer_type", "if_devide_out", "momentum", "ema_schedule",
+        "norm_target", "num_heads", "mlp_ratio",
     ]
     for key in keys:
         if key in checkpoint_config:
