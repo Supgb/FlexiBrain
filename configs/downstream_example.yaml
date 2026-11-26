@@ -25,6 +25,8 @@ data:
   path_id_mode: auto
   batch_size: 4
   num_workers: 8
+  prefetch_factor: 1
+  persistent_workers: true
   T_prime: 30
   tau_seconds: 6.0
   default_tr: null
@@ -40,6 +42,7 @@ training:
   grad_clip: 1.0
   seed: 42
   use_amp: true
+  amp_dtype: bfloat16
 logging:
   log_interval: 20
   checkpoint_dir: ./checkpoints/downstream/example

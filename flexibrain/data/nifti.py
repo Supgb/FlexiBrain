@@ -3,12 +3,17 @@ import os
 import glob
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import nibabel as nib
 import torch
 from torch.utils.data import Dataset
+
+try:
+    from isal import igzip as _igzip
+except ImportError:
+    _igzip = None
 
 
 class fMRIDataset(Dataset):
@@ -137,15 +142,82 @@ def _space_time_units_to_mm_s(header: nib.nifti1.Nifti1Header) -> Tuple[Tuple[fl
     return (float(vx), float(vy), float(vz)), float(tr)
 
 
-def _load_nifti(path: Union[str, Path], mmap: bool = True) -> Tuple[np.ndarray, np.ndarray, nib.nifti1.Nifti1Header]:
+def _is_unscaled_float32(img: nib.spatialimages.SpatialImage) -> bool:
+    if img.header.get_data_dtype() != np.float32:
+        return False
+    dataobj = getattr(img, "dataobj", None)
+    if dataobj is None:
+        return False
+    slope = getattr(dataobj, "slope", 1.0)
+    inter = getattr(dataobj, "inter", 0.0)
+    slope_identity = slope is None or (isinstance(slope, float) and np.isnan(slope)) or float(slope) == 1.0
+    inter_identity = inter is None or (isinstance(inter, float) and np.isnan(inter)) or float(inter) == 0.0
+    return slope_identity and inter_identity
+
+
+def _read_nifti_data(img: nib.spatialimages.SpatialImage, max_frames: Optional[int] = None) -> np.ndarray:
+    if max_frames is not None and len(img.shape) >= 4 and max_frames < img.shape[3]:
+        if _is_unscaled_float32(img):
+            # Slice directly through ArrayProxy so gzip decompression stops after max_frames.
+            raw_slice = img.dataobj[..., :max_frames]
+            return np.array(raw_slice, dtype=np.float32, order="F", copy=True)
+        full_data = img.get_fdata(dtype=np.float32)
+        return np.array(full_data[..., :max_frames], order="F", copy=True)
+
+    full_data = img.get_fdata(dtype=np.float32)
+    if (not full_data.flags.writeable) or (full_data.base is not None):
+        return np.array(full_data, order="F", copy=True)
+    return full_data
+
+
+def _load_nifti(
+    path: Union[str, Path],
+    mmap: bool = True,
+    max_frames_fn: Optional[Callable[[nib.nifti1.Nifti1Header], Optional[int]]] = None,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[nib.nifti1.Nifti1Header]]:
+    path_str = str(path)
+    use_igzip = _igzip is not None and path_str.lower().endswith(".gz")
+
+    if use_igzip:
+        fallback_to_nib = False
+        try:
+            with _igzip.open(path_str, "rb") as f:
+                try:
+                    fh = nib.FileHolder(fileobj=f)
+                    img = nib.Nifti1Image.from_file_map({"header": fh, "image": fh})
+                    affine = img.affine.copy()
+                    header = img.header.copy()
+                except (nib.filebasedimages.ImageFileError, nib.spatialimages.HeaderDataError):
+                    fallback_to_nib = True
+                    img = None
+                except Exception:
+                    return None, None, None
+
+                if not fallback_to_nib:
+                    # Run metadata/frame callback outside the file-I/O error handler so validation errors propagate.
+                    max_frames = max_frames_fn(header) if max_frames_fn is not None else None
+                    try:
+                        data = _read_nifti_data(img, max_frames=max_frames)
+                        return data, affine, header
+                    except Exception:
+                        return None, None, None
+        except OSError:
+            return None, None, None
+        if not fallback_to_nib:
+            return None, None, None
+
     try:
-        img = nib.load(str(path), mmap=mmap)
-        data = img.get_fdata(dtype=np.float32)
+        img = nib.load(path_str, mmap=mmap)
         affine = img.affine.copy()
         header = img.header.copy()
+    except Exception:
+        return None, None, None
+
+    max_frames = max_frames_fn(header) if max_frames_fn is not None else None
+    try:
+        data = _read_nifti_data(img, max_frames=max_frames)
         return data, affine, header
-    except Exception as e:
-        # Return None to signal invalid file
+    except Exception:
         return None, None, None
 
 
@@ -276,26 +348,35 @@ class NiftiTxtDataset(Dataset):
         while attempt < max_attempts:
             current_idx = (idx + attempt) % len(self.paths)
             p = self.paths[current_idx]
-            data, affine, header = _load_nifti(p, mmap=self.memory_map)
+            resolved_meta: Dict[str, object] = {}
+
+            def _select_frames(hdr: nib.nifti1.Nifti1Header) -> Optional[int]:
+                voxel_v, tr_v = self._get_meta(current_idx, hdr)
+                shape = hdr.get_data_shape()
+                t_total = int(shape[3]) if len(shape) >= 4 else 1
+                t_sel = self._calculate_T_selected(tr_v, t_total)
+                resolved_meta["voxel"] = voxel_v
+                resolved_meta["tr"] = tr_v
+                resolved_meta["T_selected"] = t_sel
+                return t_sel if (len(shape) >= 4 and t_sel < t_total) else None
+
+            data, affine, header = _load_nifti(p, mmap=self.memory_map, max_frames_fn=_select_frames)
 
             # If file is valid, process it
             if data is not None:
-                voxel, tr = self._get_meta(current_idx, header)
+                if "voxel" in resolved_meta:
+                    voxel = resolved_meta["voxel"]
+                    tr = resolved_meta["tr"]
+                    T_selected = resolved_meta["T_selected"]
+                else:
+                    voxel, tr = self._get_meta(current_idx, header)
+                    T_total = data.shape[3] if len(data.shape) >= 4 else 1
+                    T_selected = self._calculate_T_selected(tr, T_total)
 
-                # # 检测到tr=2或者1.96
-                # if not (np.isclose(tr, 2.0, atol=1e-2) or np.isclose(tr, 1.96, atol=1e-2)):
-                #     attempt += 1
-                #     continue
-                # print(f"TR is {tr} for {p}")
+                # Copy slice in F-order if data still holds trailing frames so the full volume can be freed immediately.
+                if len(data.shape) >= 4 and T_selected < data.shape[3]:
+                    data = np.array(data[..., :T_selected], order="F", copy=True)
 
-                # Calculate T_selected based on T_prime and tau_seconds
-                T_total = data.shape[3] if len(data.shape) >= 4 else 1
-                T_selected = self._calculate_T_selected(tr, T_total)
-
-                # Slice data to T_selected frames
-                if len(data.shape) >= 4 and T_selected < T_total:
-                    data = data[..., :T_selected]
-                
                 sample = {
                     "data": torch.from_numpy(data) if self.return_torch else data,
                     "affine": torch.from_numpy(affine) if self.return_torch else affine,

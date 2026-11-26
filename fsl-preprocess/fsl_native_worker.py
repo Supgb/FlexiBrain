@@ -7,6 +7,7 @@ import argparse
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,7 +15,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import nibabel as nib
 import numpy as np
 
-from slice_timing import (
+THIS_DIR = Path(__file__).resolve().parent
+REPO_ROOT = THIS_DIR.parent
+for _p in (str(THIS_DIR), str(REPO_ROOT)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from data_process import center_affine_origin  # noqa: E402
+from slice_timing import (  # noqa: E402
     acq_times_to_fsl_tcustom,
     compute_acquisition_times_sec,
     load_bids_slice_timing,
@@ -206,8 +214,10 @@ def process_single_run(
     staged_dir: Optional[Path] = None,
     drop_initial_trs: int = 0,
     auto_drop_nonsteady: bool = False,
+    skip_stc: bool = False,
+    center_origin: str = "foreground",
 ) -> Dict[str, Any]:
-    """Run TR trimming -> STC -> HMC -> BET -> native masking for a single 4D BOLD run."""
+    """Run TR trimming -> optional STC -> HMC -> BET -> native masking & origin centering."""
     t0 = time.perf_counter()
     work_dir = output_root / "work" / "runs" / run_id
     if work_dir.exists():
@@ -263,14 +273,17 @@ def process_single_run(
             stc_input = raw_path
             target_shape = orig_shape
 
-        # 1. Slice-Timing Correction
+        # 1. Slice-Timing Correction (explicit skip takes precedence over BIDS JSON and protocol YAML)
         stc_source = stc_input
         stc_method = "skipped"
         num_slices = target_shape[2]
-        if bids_st is not None and len(bids_st) == num_slices:
+        if skip_stc or slice_scheme == "skip":
+            offsets = None
+            stc_method = "skipped"
+        elif bids_st is not None and len(bids_st) == num_slices:
             offsets = acq_times_to_fsl_tcustom(bids_st, tr_sec)
             stc_method = "bids_json"
-        elif slice_scheme and slice_scheme != "skip":
+        elif slice_scheme:
             acq_times = compute_acquisition_times_sec(num_slices, tr_sec, slice_scheme, z_axis_code=z_axis_code)
             offsets = acq_times_to_fsl_tcustom(acq_times, tr_sec)
             stc_method = f"protocol:{slice_scheme}"
@@ -314,7 +327,6 @@ def process_single_run(
 
         # 3. Brain Extraction on motion-corrected mean volume
         mask_path, fg_frac, bet_note = _run_bet_with_fallback(mcf_mean, work_dir, env, fsl_dir, bet_f=bet_f)
-        _atomic_copy(mask_path, out_mask)
 
         # 4. Mask 4D BOLD via fslmaths & guarantee exact 0.0 background + native header metadata
         masked_tmp = work_dir / "masked.nii.gz"
@@ -329,24 +341,42 @@ def process_single_run(
         if masked_img.shape != target_shape:
             raise ValueError(f"Output shape mismatch for {run_id}: target={target_shape}, masked={masked_img.shape}")
 
-        mask_arr = np.asarray(nib.load(str(mask_path)).dataobj) > 0
+        mask_img_tmp = nib.load(str(mask_path))
+        mask_arr = np.asarray(mask_img_tmp.dataobj) > 0
         arr = np.asarray(masked_img.dataobj, dtype=np.float32).copy()
         if not np.isfinite(arr).all():
             arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
         arr[~mask_arr, :] = 0.0
 
-        # Preserve original native geometry, voxel spacing, and TR in ('mm', 'sec')
+        # Preserve native voxel spacing, orientation, and obliquity; optionally center world origin
+        out_affine, raw_origin_mm, centered_origin_mm = center_affine_origin(
+            orig_affine,
+            target_shape[:3],
+            foreground_mask=mask_arr,
+            mode=center_origin,
+        )
         out_header = orig_header.copy()
         out_header.set_data_dtype(np.float32)
         out_header.set_zooms((voxel_mm[0], voxel_mm[1], voxel_mm[2], tr_sec))
         out_header.set_xyzt_units(xyz="mm", t="sec")
         qcode = int(out_header.get("qform_code", 1)) or 1
         scode = int(out_header.get("sform_code", 1)) or 1
-        out_img = nib.Nifti1Image(arr, orig_affine, header=out_header)
+        out_img = nib.Nifti1Image(arr, out_affine, header=out_header)
         out_img.set_data_dtype(np.float32)
-        out_img.set_qform(orig_affine, code=qcode)
-        out_img.set_sform(orig_affine, code=scode)
+        out_img.set_qform(out_affine, code=qcode)
+        out_img.set_sform(out_affine, code=scode)
         _atomic_save_nifti(out_img, out_nifti)
+
+        # Save brain mask with identical affine/qform/sform so mask and BOLD stay world-aligned
+        mask_header = mask_img_tmp.header.copy()
+        mask_header.set_data_dtype(np.uint8)
+        mask_header.set_zooms((voxel_mm[0], voxel_mm[1], voxel_mm[2]))
+        mask_header.set_xyzt_units(xyz="mm", t="unknown")
+        mask_out_img = nib.Nifti1Image(mask_arr.astype(np.uint8), out_affine, header=mask_header)
+        mask_out_img.set_data_dtype(np.uint8)
+        mask_out_img.set_qform(out_affine, code=qcode)
+        mask_out_img.set_sform(out_affine, code=scode)
+        _atomic_save_nifti(mask_out_img, out_mask)
 
         if cleanup_staged_raw and staged_dir is not None:
             try:
@@ -369,6 +399,9 @@ def process_single_run(
             "tr_sec": round(tr_sec, 6),
             "z_axis": z_axis_code,
             "stc_method": stc_method,
+            "origin_mode": center_origin,
+            "raw_origin_mm": [round(v, 3) for v in raw_origin_mm],
+            "centered_origin_mm": [round(v, 4) for v in centered_origin_mm],
             "bet_note": bet_note,
             "fg_frac": round(fg_frac, 5),
             "mean_fd_mm": round(mean_fd, 5),
@@ -392,6 +425,9 @@ def process_single_run(
             "tr_sec": 0.0,
             "z_axis": "",
             "stc_method": "",
+            "origin_mode": center_origin,
+            "raw_origin_mm": [],
+            "centered_origin_mm": [],
             "bet_note": "",
             "fg_frac": 0.0,
             "mean_fd_mm": 0.0,
@@ -418,6 +454,8 @@ def main() -> int:
     parser.add_argument("--bet-f", type=float, default=0.3)
     parser.add_argument("--drop-initial-trs", type=int, default=0)
     parser.add_argument("--auto-drop-nonsteady", action="store_true")
+    parser.add_argument("--skip-stc", action="store_true")
+    parser.add_argument("--center-origin", choices=["foreground", "grid", "none"], default="foreground")
     parser.add_argument("--keep-work", action="store_true")
     args = parser.parse_args()
 
@@ -434,6 +472,8 @@ def main() -> int:
         keep_work=args.keep_work,
         drop_initial_trs=args.drop_initial_trs,
         auto_drop_nonsteady=args.auto_drop_nonsteady,
+        skip_stc=args.skip_stc,
+        center_origin=args.center_origin,
     )
     print(res)
     return 0 if res["status"] == "ok" else 1

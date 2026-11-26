@@ -1,11 +1,13 @@
 dataset: adhd200
 default_scheme: null
-default_drop_initial_trs: 0
+default_drop_initial_trs: 5
 description: >
-  Verified slice acquisition protocols for ADHD-200 sites (used when BIDS
-  SliceTiming sidecars are absent or do not match the volume slice count).
-  All sites except KKI (Philips sequential ascending) use Siemens interleaved
-  ascending (Transversal F >> H) acquisition.
+  Verified slice acquisition protocols for ADHD-200 sites (used only when STC is
+  enabled and BIDS SliceTiming sidecars are absent or do not match slice count).
+  Unified default_drop_initial_trs: 5 aligns T1 equilibration trimming with
+  ABIDE1; 1,401/1,402 runs still meet T_prime=30 (tau=6.0s), with only 1
+  pre-existing 59-frame OHSU run below 60 frames. All sites except KKI
+  (Philips sequential ascending) use Siemens interleaved ascending (F >> H).
 sites:
   # Philips 3T sequential ascending
   KKI: seq_asc

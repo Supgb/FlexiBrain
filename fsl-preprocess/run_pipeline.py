@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import os
+import shutil
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -46,6 +47,9 @@ MANIFEST_FIELDS = [
     "tr_sec",
     "z_axis",
     "stc_method",
+    "origin_mode",
+    "raw_origin_mm",
+    "centered_origin_mm",
     "bet_note",
     "fg_frac",
     "mean_fd_mm",
@@ -74,9 +78,22 @@ def _filter_records(
 
 
 def _run_fsl_worker_task(
-    task: Tuple[RunRecord, Path, Path, Path, float, bool, bool, Path, int, bool]
+    task: Tuple[RunRecord, Path, Path, Path, float, bool, bool, Path, int, bool, bool, str]
 ) -> Dict[str, Any]:
-    rec, raw_path, output_root, fsl_dir, bet_f, keep_work, cleanup_staged, stage_dir, drop_initial_trs, auto_drop_nonsteady = task
+    (
+        rec,
+        raw_path,
+        output_root,
+        fsl_dir,
+        bet_f,
+        keep_work,
+        cleanup_staged,
+        stage_dir,
+        drop_initial_trs,
+        auto_drop_nonsteady,
+        skip_stc,
+        center_origin,
+    ) = task
     return process_single_run(
         run_id=rec.run_id,
         out_stem=rec.out_stem,
@@ -92,6 +109,8 @@ def _run_fsl_worker_task(
         staged_dir=stage_dir,
         drop_initial_trs=drop_initial_trs,
         auto_drop_nonsteady=auto_drop_nonsteady,
+        skip_stc=skip_stc,
+        center_origin=center_origin,
     )
 
 
@@ -112,7 +131,8 @@ def _run_data_process_task(task: Tuple[Path, Path, Path, Path, bool]) -> Tuple[s
     return status, str(out_file)
 
 
-def _qc_one_flexibrain_file(path: Path) -> Dict[str, Any]:
+def _qc_one_flexibrain_file(task: Tuple[Path, str]) -> Dict[str, Any]:
+    path, expected_center_origin = task
     try:
         img = nib.load(str(path))
         shape = img.shape
@@ -137,17 +157,36 @@ def _qc_one_flexibrain_file(path: Path) -> Dict[str, Any]:
 
         bg_mask = (arr == 0).all(axis=3)
         bg_zero_frac = float(bg_mask.mean())
-        fg_vals = arr[~bg_mask, :]
+        fg_mask = ~bg_mask
+        fg_vals = arr[fg_mask, :]
         if fg_vals.size == 0:
             ok = False
             reasons.append("empty_foreground")
             fg_mean, fg_std = 0.0, 0.0
+            origin_mm = [0.0, 0.0, 0.0]
+            origin_norm_mm = 0.0
         else:
             fg_mean = float(fg_vals.mean())
             fg_std = float(fg_vals.std())
             if abs(fg_mean) > 1e-2 or not (0.95 <= fg_std <= 1.05):
                 ok = False
                 reasons.append(f"bad_zscore(mean={fg_mean:.4f},std={fg_std:.4f})")
+
+            if expected_center_origin == "grid":
+                c_vox = (np.asarray(shape[:3], dtype=np.float64) - 1.0) / 2.0
+            else:
+                c_vox = np.argwhere(fg_mask).mean(axis=0).astype(np.float64)
+            origin_vec = img.affine[:3, :3] @ c_vox + img.affine[:3, 3]
+            origin_mm = [round(float(v), 4) for v in origin_vec]
+            origin_norm_mm = float(np.linalg.norm(origin_vec))
+            if expected_center_origin in ("foreground", "grid") and origin_norm_mm > 1e-2:
+                ok = False
+                reasons.append(f"uncentered_origin(mode={expected_center_origin},norm_mm={origin_norm_mm:.4f})")
+
+        qform_sform_max_diff = float(np.abs(img.get_qform() - img.get_sform()).max())
+        if not np.isfinite(qform_sform_max_diff) or qform_sform_max_diff > 1e-2:
+            ok = False
+            reasons.append(f"qform_sform_mismatch(max_diff={qform_sform_max_diff:.5f})")
 
         if not (0.50 <= bg_zero_frac <= 0.992):
             ok = False
@@ -164,6 +203,9 @@ def _qc_one_flexibrain_file(path: Path) -> Dict[str, Any]:
             "bg_zero_frac": round(bg_zero_frac, 5),
             "fg_mean": round(fg_mean, 6),
             "fg_std": round(fg_std, 6),
+            "origin_mm": origin_mm,
+            "origin_norm_mm": round(origin_norm_mm, 5),
+            "qform_sform_max_diff": round(qform_sform_max_diff, 6),
         }
     except Exception as exc:
         return {
@@ -177,15 +219,20 @@ def _qc_one_flexibrain_file(path: Path) -> Dict[str, Any]:
             "bg_zero_frac": 0.0,
             "fg_mean": 0.0,
             "fg_std": 0.0,
+            "origin_mm": [],
+            "origin_norm_mm": 0.0,
+            "qform_sform_max_diff": 0.0,
         }
 
 
-def _check_fsl_binaries(fsl_dir: Path) -> None:
+def _check_fsl_binaries(fsl_dir: Path, require_slicetimer: bool = True) -> None:
     env = build_fsl_env(fsl_dir)
-    import shutil
+    required = ["mcflirt", "fslmaths"]
+    if require_slicetimer:
+        required.insert(0, "slicetimer")
 
     missing = []
-    for req in ("slicetimer", "mcflirt", "fslmaths"):
+    for req in required:
         if shutil.which(req, path=env["PATH"]) is None:
             missing.append(req)
     if shutil.which("bet", path=env["PATH"]) is None and shutil.which("bet2", path=env["PATH"]) is None:
@@ -211,6 +258,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--bet-f", type=float, default=0.3)
     p.add_argument("--drop-initial-trs", type=int, default=None, help="Override initial dummy TRs to drop per run before STC/HMC.")
     p.add_argument("--auto-drop-nonsteady", action="store_true", help="Extend TR trimming past contiguous initial non-steady outlier volumes.")
+    p.add_argument("--skip-stc", action="store_true", help="Disable slice-timing correction regardless of BIDS JSON or protocol YAML.")
+    p.add_argument(
+        "--center-origin",
+        choices=["foreground", "grid", "none"],
+        default="foreground",
+        help="Shift native affine translation so brain foreground centroid ('foreground') or grid center ('grid') sits at [0, 0, 0] mm.",
+    )
     p.add_argument("--subjects", default=None, help="Comma-separated subject IDs to process (optional).")
     p.add_argument("--limit", type=int, default=None, help="Process at most N runs (optional).")
     p.add_argument("--skip-fsl", action="store_true")
@@ -246,8 +300,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     qc_dir.mkdir(parents=True, exist_ok=True)
 
     fsl_failed = 0
+    manifest_path = qc_dir / "pipeline_manifest.csv"
+    existing_rows: Dict[str, Dict[str, Any]] = {}
+    if manifest_path.exists():
+        with open(manifest_path, "r", encoding="utf-8", newline="") as f:
+            for row in csv.DictReader(f):
+                existing_rows[row["run_id"]] = row
+
     if not args.skip_fsl:
-        _check_fsl_binaries(args.fsl_dir)
+        _check_fsl_binaries(args.fsl_dir, require_slicetimer=not args.skip_stc)
         pending: List[RunRecord] = []
         skipped_existing = 0
         for rec in records:
@@ -257,13 +318,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             else:
                 pending.append(rec)
         print(f"[FSL] pending={len(pending)}, skipped_existing={skipped_existing}")
-
-        manifest_path = qc_dir / "pipeline_manifest.csv"
-        existing_rows: Dict[str, Dict[str, Any]] = {}
-        if manifest_path.exists():
-            with open(manifest_path, "r", encoding="utf-8", newline="") as f:
-                for row in csv.DictReader(f):
-                    existing_rows[row["run_id"]] = row
 
         if pending:
             t_stage = time.perf_counter()
@@ -282,6 +336,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     stage_dir,
                     resolve_drop_initial_trs(rec.site, protocol, cli_override=args.drop_initial_trs),
                     args.auto_drop_nonsteady,
+                    args.skip_stc,
+                    args.center_origin,
                 )
                 for rec in pending
             ]
@@ -365,19 +421,40 @@ def main(argv: Optional[List[str]] = None) -> int:
     ]
     qc_results: List[Dict[str, Any]] = []
     if qc_targets:
-        max_w = max(1, min(args.workers, len(qc_targets)))
+        qc_tasks = [(p, args.center_origin) for p in qc_targets]
+        max_w = max(1, min(args.workers, len(qc_tasks)))
         with ProcessPoolExecutor(max_workers=max_w) as ex:
-            futs = [ex.submit(_qc_one_flexibrain_file, p) for p in qc_targets]
+            futs = [ex.submit(_qc_one_flexibrain_file, t) for t in qc_tasks]
             iterator = as_completed(futs)
             if tqdm is not None:
                 iterator = tqdm(iterator, total=len(futs), desc="QC audit")
             for fut in iterator:
                 qc_results.append(fut.result())
 
+    selected_rids = {rec.run_id for rec in records}
+    stc_method_counts: Dict[str, int] = {}
+    origin_mode_counts: Dict[str, int] = {}
+    for rid in selected_rids:
+        row = existing_rows.get(rid)
+        if not row:
+            continue
+        sm = str(row.get("stc_method", "")) or "unknown"
+        stc_method_counts[sm] = stc_method_counts.get(sm, 0) + 1
+        om = str(row.get("origin_mode", "")) or "unknown"
+        origin_mode_counts[om] = origin_mode_counts.get(om, 0) + 1
+
     qc_failed_items = [r for r in qc_results if not r["ok"]]
+    max_origin_norm = max((r.get("origin_norm_mm", 0.0) for r in qc_results), default=0.0)
+    max_qform_sform_diff = max((r.get("qform_sform_max_diff", 0.0) for r in qc_results), default=0.0)
     qc_summary = {
         "dataset": args.dataset,
         "selected_runs": len(records),
+        "skip_stc": bool(args.skip_stc),
+        "center_origin": args.center_origin,
+        "auto_drop_nonsteady": bool(args.auto_drop_nonsteady),
+        "drop_initial_trs_override": args.drop_initial_trs,
+        "stc_method_counts": stc_method_counts,
+        "origin_mode_counts": origin_mode_counts,
         "fsl_failed": fsl_failed,
         "data_process_failed": dp_failed,
         "final_files_present": len(qc_targets),
@@ -385,6 +462,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "missing_final_sample": missing_final[:20],
         "qc_passed": len(qc_results) - len(qc_failed_items),
         "qc_failed": len(qc_failed_items),
+        "max_origin_norm_mm": round(float(max_origin_norm), 5),
+        "max_qform_sform_diff_mm": round(float(max_qform_sform_diff), 6),
         "qc_failed_items": qc_failed_items[:20],
         "elapsed_sec": round(time.perf_counter() - t_start, 2),
     }

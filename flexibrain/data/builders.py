@@ -10,13 +10,27 @@ from flexibrain.data.classification import ClassificationDataset, custom_collate
 from flexibrain.data.collate import custom_collate_fn as pretrain_collate
 
 
+def _dataloader_worker_kwargs(data: DataConfig, *, allow_persistent: bool) -> dict:
+    kwargs: dict = {
+        "num_workers": int(data.num_workers),
+        "pin_memory": True,
+    }
+    if kwargs["num_workers"] > 0:
+        if data.prefetch_factor is not None:
+            kwargs["prefetch_factor"] = int(data.prefetch_factor)
+        kwargs["persistent_workers"] = bool(data.persistent_workers) if allow_persistent else False
+    return kwargs
+
+
 def build_pretrain_dataloaders(data: DataConfig, training: TrainingConfig, rank: int = 0, world_size: int = 1) -> Tuple[DataLoader, DataLoader]:
     train_set = NiftiTxtDataset(data.train_list, return_torch=True, memory_map=data.memory_map, cache_meta=True, T_prime=data.T_prime, tau_seconds=data.tau_seconds, default_tr=data.default_tr)
     val_set = NiftiTxtDataset(data.val_list, return_torch=True, memory_map=data.memory_map, cache_meta=True, T_prime=data.T_prime, tau_seconds=data.tau_seconds, default_tr=data.default_tr)
     train_sampler = DistributedSampler(train_set, num_replicas=world_size, rank=rank, shuffle=True, seed=training.seed) if world_size > 1 else None
     val_sampler = DistributedSampler(val_set, num_replicas=world_size, rank=rank, shuffle=False, seed=training.seed) if world_size > 1 else None
-    train_loader = DataLoader(train_set, batch_size=data.batch_size, sampler=train_sampler, shuffle=train_sampler is None, num_workers=data.num_workers, pin_memory=True, drop_last=True, collate_fn=pretrain_collate)
-    val_loader = DataLoader(val_set, batch_size=data.batch_size, sampler=val_sampler, shuffle=False, num_workers=data.num_workers, pin_memory=True, drop_last=False, collate_fn=pretrain_collate)
+    train_worker_kwargs = _dataloader_worker_kwargs(data, allow_persistent=True)
+    eval_worker_kwargs = _dataloader_worker_kwargs(data, allow_persistent=False)
+    train_loader = DataLoader(train_set, batch_size=data.batch_size, sampler=train_sampler, shuffle=train_sampler is None, drop_last=True, collate_fn=pretrain_collate, **train_worker_kwargs)
+    val_loader = DataLoader(val_set, batch_size=data.batch_size, sampler=val_sampler, shuffle=False, drop_last=False, collate_fn=pretrain_collate, **eval_worker_kwargs)
     return train_loader, val_loader
 
 
@@ -50,9 +64,11 @@ def build_downstream_dataloaders(data: DataConfig, training: TrainingConfig, ran
     val_sampler = DistributedSampler(val_set, num_replicas=world_size, rank=rank, shuffle=False, seed=training.seed) if world_size > 1 else None
     test_sampler = DistributedSampler(test_set, num_replicas=world_size, rank=rank, shuffle=False, seed=training.seed) if world_size > 1 and test_set is not None else None
     eval_batch_size = data.eval_batch_size or data.batch_size
-    train_loader = DataLoader(train_set, batch_size=data.batch_size, sampler=train_sampler, shuffle=train_sampler is None, num_workers=data.num_workers, pin_memory=True, drop_last=True, collate_fn=downstream_collate)
-    val_loader = DataLoader(val_set, batch_size=eval_batch_size, sampler=val_sampler, shuffle=False, num_workers=data.num_workers, pin_memory=True, drop_last=False, collate_fn=downstream_collate)
+    train_worker_kwargs = _dataloader_worker_kwargs(data, allow_persistent=True)
+    eval_worker_kwargs = _dataloader_worker_kwargs(data, allow_persistent=False)
+    train_loader = DataLoader(train_set, batch_size=data.batch_size, sampler=train_sampler, shuffle=train_sampler is None, drop_last=True, collate_fn=downstream_collate, **train_worker_kwargs)
+    val_loader = DataLoader(val_set, batch_size=eval_batch_size, sampler=val_sampler, shuffle=False, drop_last=False, collate_fn=downstream_collate, **eval_worker_kwargs)
     test_loader = None
     if test_set is not None:
-        test_loader = DataLoader(test_set, batch_size=eval_batch_size, sampler=test_sampler, shuffle=False, num_workers=data.num_workers, pin_memory=True, drop_last=False, collate_fn=downstream_collate)
+        test_loader = DataLoader(test_set, batch_size=eval_batch_size, sampler=test_sampler, shuffle=False, drop_last=False, collate_fn=downstream_collate, **eval_worker_kwargs)
     return train_loader, val_loader, test_loader

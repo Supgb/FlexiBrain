@@ -15,12 +15,12 @@ CONDA_PKGS_DIRS=/mnt/ironwolf/conda-pkgs conda create -y --override-channels \
 
 ## 2. Pipeline Steps Per Run
 
-0. **Dummy / Non-Steady-State TR Trimming**: Drops protocol-specified initial dummy volumes (`default_drop_initial_trs`, e.g., `5` for ABIDE1 to remove T1 equilibration transients) and optionally extends past contiguous outlier prefix frames when `--auto-drop-nonsteady` is set, prior to slice-timing and motion correction.
-1. **Slice-Timing Correction (`slicetimer`)**: Uses BIDS JSON `SliceTiming` when present and matching `num_slices`, or site protocol from `protocols/<dataset>.yaml` (converted via `slice_timing.py` to FSL `--tcustom` TR-fraction shifts centered on the acquisition midpoint). Set scheme to `skip` for multiband sequences without `SliceTiming`.
+0. **Dummy / Non-Steady-State TR Trimming**: Drops protocol-specified initial dummy volumes (`default_drop_initial_trs: 5` for both ABIDE1 and ADHD-200 to remove T1 equilibration transients) and optionally extends past contiguous outlier prefix frames when `--auto-drop-nonsteady` is set, prior to slice-timing and motion correction.
+1. **Optional Slice-Timing Correction (`slicetimer`)**: Pass `--skip-stc` (recommended for ABIDE1 and ADHD-200 where per-scan scanner `SliceTiming` metadata is absent) or set site scheme to `skip` to bypass `slicetimer` while keeping BIDS JSON `RepetitionTime` fallback intact. When enabled, uses BIDS JSON `SliceTiming` matching `num_slices`, or site protocol from `protocols/<dataset>.yaml`.
 2. **Head-Motion Correction (`mcflirt`)**: Rigid 6-DOF motion correction in native space (`-meanvol -plots`), keeping native voxel resolution and saving `*.par` + framewise displacement stats.
 3. **Brain Extraction (`bet` / `bet2`)**: Skull-strips the motion-corrected mean volume (`-f 0.3 -m`, with automatic fallback if foreground mask fraction is degenerate).
-4. **Native Masking & Header Preservation (`fslmaths` + `nibabel`)**: Applies the native brain mask so background voxels are strictly `0.0`, restores exact native `(vx, vy, vz, TR)` in `('mm', 'sec')` and `qform`/`sform`, and writes `<output_root>/fsl_native/nativespace/<out_stem>.nii.gz`.
-5. **FlexiBrain `96x96x96` Conversion (`data_process.py`)**: Center pads/crops to `96x96x96` while updating `affine[:3, 3]` and applies sample-wise global foreground z-scoring (`<output_root>/flexibrain_ready/nativespace/*_global_zscore.nii.gz`).
+4. **Native Masking, Origin Centering, & Header Preservation (`fslmaths` + `nibabel`)**: Applies the native brain mask so background voxels are strictly `0.0`, restores exact native `(vx, vy, vz, TR)` in `('mm', 'sec')` and `A[:3, :3]` (voxel spacing, orientation, and obliquity), shifts `affine[:3, 3]` so the brain foreground centroid (`--center-origin foreground`, default) sits at `[0, 0, 0]` mm with synchronized `qform`/`sform` on both BOLD and mask, and writes `<output_root>/fsl_native/nativespace/<out_stem>.nii.gz`.
+5. **FlexiBrain `96x96x96` Conversion (`data_process.py`)**: Center pads/crops to `96x96x96` while updating `affine[:3, 3]` (preserving the `[0, 0, 0]` mm centered brain origin) and applies sample-wise global foreground z-scoring (`<output_root>/flexibrain_ready/nativespace/*_global_zscore.nii.gz`).
 
 ## 3. Running ABIDE1
 
@@ -28,20 +28,22 @@ CONDA_PKGS_DIRS=/mnt/ironwolf/conda-pkgs conda create -y --override-channels \
 /home/ubuntu/projects/FlexiBrain/.venv/bin/python fsl-preprocess/run_pipeline.py \
   --dataset abide1 \
   --input-root /mnt/barracuda/ABIDE1 \
-  --output-root /mnt/ironwolf/abide1-fsl \
+  --output-root /mnt/ironwolf/abide1-fsl-nostc \
   --index-json /mnt/barracuda/abide1-prep/status/abide_index.json \
   --protocol-yaml fsl-preprocess/protocols/abide1.yaml \
   --fsl-dir /mnt/ironwolf/conda-envs/fsl-tools \
   --workers 20 \
   --stage-workers 8 \
-  --auto-drop-nonsteady
+  --auto-drop-nonsteady \
+  --skip-stc \
+  --center-origin foreground
 
 /home/ubuntu/projects/FlexiBrain/.venv/bin/python fsl-preprocess/make_splits.py \
-  --nifti-dir /mnt/ironwolf/abide1-fsl/flexibrain_ready/nativespace \
+  --nifti-dir /mnt/ironwolf/abide1-fsl-nostc/flexibrain_ready/nativespace \
   --phenotypic-csv /mnt/barracuda/abide1-prep/Phenotypic_V1_0b.csv \
-  --manifest-csv /mnt/ironwolf/abide1-fsl/qc/pipeline_manifest.csv \
+  --manifest-csv /mnt/ironwolf/abide1-fsl-nostc/qc/pipeline_manifest.csv \
   --max-mean-fd 0.5 \
-  --output-dir /mnt/ironwolf/abide1-fsl
+  --output-dir /mnt/ironwolf/abide1-fsl-nostc
 ```
 
 ## 4. Extending to ADHD200 or HCP-YA
@@ -51,23 +53,25 @@ CONDA_PKGS_DIRS=/mnt/ironwolf/conda-pkgs conda create -y --override-channels \
   /home/ubuntu/projects/FlexiBrain/.venv/bin/python fsl-preprocess/run_pipeline.py \
     --dataset bids \
     --input-root /mnt/barracuda/ADHD200 \
-    --output-root /mnt/ironwolf/adhd200-fsl \
+    --output-root /mnt/ironwolf/adhd200-fsl-nostc \
     --protocol-yaml fsl-preprocess/protocols/adhd200.yaml \
     --fsl-dir /mnt/ironwolf/conda-envs/fsl-tools \
     --workers 20 \
-    --auto-drop-nonsteady
+    --auto-drop-nonsteady \
+    --skip-stc \
+    --center-origin foreground
 
   /home/ubuntu/projects/FlexiBrain/.venv/bin/python fsl-preprocess/make_splits.py \
-    --nifti-dir /mnt/ironwolf/adhd200-fsl/flexibrain_ready/nativespace \
+    --nifti-dir /mnt/ironwolf/adhd200-fsl-nostc/flexibrain_ready/nativespace \
     --phenotypic-csv /mnt/barracuda/ADHD200/adhd200_preprocessed_phenotypics.tsv \
-    --manifest-csv /mnt/ironwolf/adhd200-fsl/qc/pipeline_manifest.csv \
+    --manifest-csv /mnt/ironwolf/adhd200-fsl-nostc/qc/pipeline_manifest.csv \
     --label-preset adhd200_dx \
     --id-column "ScanDir ID" \
     --label-column DX \
     --site-column Site \
     --max-mean-fd 0.5 \
     --include-unlabeled-in-pretrain \
-    --output-dir /mnt/ironwolf/adhd200-fsl
+    --output-dir /mnt/ironwolf/adhd200-fsl-nostc
   ```
 - **HCP-YA (unprocessed ZIPs)**:
   ```bash

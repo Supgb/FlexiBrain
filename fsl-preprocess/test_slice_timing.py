@@ -41,7 +41,8 @@ def test_adhd200_protocol_yaml() -> None:
     assert resolve_site_scheme("KKI", proto) == "seq_asc"
     for siemens_site in ("NYU", "NeuroIMAGE", "OHSU", "Peking_1", "Peking_2", "Peking_3", "Pittsburgh", "WashU", "Brown"):
         assert resolve_site_scheme(siemens_site, proto) == "siemens_interleaved_fh", siemens_site
-    assert resolve_drop_initial_trs("OHSU", proto) == 0
+    assert resolve_drop_initial_trs("OHSU", proto) == 5
+    assert resolve_drop_initial_trs("OHSU", proto, cli_override=0) == 0
 
 
 def test_acquisition_orders_and_tcustom() -> None:

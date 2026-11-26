@@ -16,6 +16,8 @@ data:
   val_list: data/lists/pretrain_val.txt
   batch_size: 4
   num_workers: 8
+  prefetch_factor: 1
+  persistent_workers: true
   T_prime: 30
   tau_seconds: 6.0
   default_tr: null
@@ -29,6 +31,7 @@ training:
   grad_accumulation_steps: 4
   seed: 42
   use_amp: true
+  amp_dtype: bfloat16
 logging:
   log_interval: 20
   checkpoint_dir: ./checkpoints/pretrain/example

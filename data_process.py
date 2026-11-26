@@ -235,14 +235,59 @@ def best_matching_file(source_file: Path, target_dir: Path) -> Optional[Path]:
     return best
 
 
-def make_output_image(z_data: np.ndarray, template_img: nib.Nifti1Image) -> nib.Nifti1Image:
+def center_affine_origin(
+    affine: np.ndarray,
+    shape_xyz: Tuple[int, int, int],
+    foreground_mask: Optional[np.ndarray] = None,
+    mode: str = "foreground",
+) -> Tuple[np.ndarray, Tuple[float, float, float], Tuple[float, float, float]]:
+    """Shift affine translation so the chosen anatomical/grid center maps to [0, 0, 0] mm.
+
+    Preserves affine[:3, :3] (voxel spacing, axis orientation, and obliquity) identically.
+    Returns (new_affine, raw_origin_mm, centered_origin_mm).
+    """
+    base_affine = np.asarray(affine, dtype=np.float64).copy()
+    if base_affine.shape != (4, 4):
+        raise ValueError(f"Expected (4, 4) affine, got {base_affine.shape}")
+    if mode not in ("none", "foreground", "grid"):
+        raise ValueError(f"Unsupported center_origin mode: {mode!r}")
+
+    linear = base_affine[:3, :3]
+    if mode == "foreground" or (mode == "none" and foreground_mask is not None and np.any(foreground_mask)):
+        if foreground_mask is None:
+            raise ValueError("foreground_mask is required when center_origin mode is 'foreground'")
+        fg_bool = np.asarray(foreground_mask, dtype=bool)
+        if fg_bool.shape != tuple(shape_xyz):
+            raise ValueError(f"foreground_mask shape {fg_bool.shape} does not match {shape_xyz}")
+        if not np.any(fg_bool):
+            raise ValueError("foreground_mask is empty; cannot compute brain centroid")
+        c_vox = np.argwhere(fg_bool).mean(axis=0).astype(np.float64)
+    else:
+        c_vox = (np.asarray(shape_xyz, dtype=np.float64) - 1.0) / 2.0
+
+    raw_origin = linear @ c_vox + base_affine[:3, 3]
+    if mode == "none":
+        return base_affine, tuple(float(v) for v in raw_origin), tuple(float(v) for v in raw_origin)
+
+    new_affine = base_affine.copy()
+    new_affine[:3, 3] = -(linear @ c_vox)
+    centered_origin = new_affine[:3, :3] @ c_vox + new_affine[:3, 3]
+    return new_affine, tuple(float(v) for v in raw_origin), tuple(float(v) for v in centered_origin)
+
+
+def make_output_image(
+    z_data: np.ndarray,
+    template_img: nib.Nifti1Image,
+    affine_override: Optional[np.ndarray] = None,
+) -> nib.Nifti1Image:
     header = template_img.header.copy()
+    affine = template_img.affine if affine_override is None else np.asarray(affine_override, dtype=np.float64)
     qcode = int(header.get("qform_code", 1)) or 1
     scode = int(header.get("sform_code", 1)) or 1
-    out_img = nib.Nifti1Image(z_data.astype(np.float32), template_img.affine, header=header)
+    out_img = nib.Nifti1Image(z_data.astype(np.float32), affine, header=header)
     out_img.set_data_dtype(np.float32)
-    out_img.set_qform(template_img.affine, code=qcode)
-    out_img.set_sform(template_img.affine, code=scode)
+    out_img.set_qform(affine, code=qcode)
+    out_img.set_sform(affine, code=scode)
     return out_img
 
 
@@ -392,8 +437,18 @@ def process_one_file(
         print(f"[DRY-RUN] Would save {out_file}")
         return "dry_run"
 
+    center_mode = getattr(args, "center_origin", "none")
+    affine_override = None
+    if center_mode != "none":
+        affine_override, _, _ = center_affine_origin(
+            new_img.affine,
+            arr.shape[:3],
+            foreground_mask=~background_mask,
+            mode=center_mode,
+        )
+
     out_file.parent.mkdir(parents=True, exist_ok=True)
-    out_img = make_output_image(z_data, new_img)
+    out_img = make_output_image(z_data, new_img, affine_override=affine_override)
     nib.save(out_img, str(out_file))
     print(f"[SAVE] {out_file}")
     return "processed"
@@ -481,6 +536,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--template-mask",
         default="MNI152_T1_2mm_Brain_Mask.nii.gz",
         help="Brain mask for MNI/template-space inputs. Relative paths are also checked next to this script.",
+    )
+    parser.add_argument(
+        "--center-origin",
+        choices=["none", "foreground", "grid"],
+        default="none",
+        help="Optionally shift affine translation so foreground centroid or volume center sits at [0, 0, 0] mm.",
     )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs.")
     parser.add_argument("--dry-run", action="store_true", help="Print planned work without writing outputs.")
