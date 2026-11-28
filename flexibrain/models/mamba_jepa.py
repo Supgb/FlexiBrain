@@ -14,11 +14,12 @@ from functools import partial
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from timm.layers import DropPath
 
 
-from flexibrain.models.mamba_blocks import RMSNorm, create_block, _init_weights, layer_norm_fn, rms_norm_fn
+from flexibrain.models.mamba_blocks import Mamba, RMSNorm, create_block, _init_weights, layer_norm_fn, rms_norm_fn
 
 
 from flexibrain.models.layers.stape import STAPE4D_TimeToSpace
@@ -124,7 +125,7 @@ class VolumeMambaJEPA(nn.Module):
             dtype=dtype,
         )
 
-        self.mask_token_ctx = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.mask_token_ctx = nn.Parameter(torch.zeros(1, 1, embed_dim, **factory_kwargs))
         torch.nn.init.normal_(self.mask_token_ctx, std=0.02)
 
         self.pred_depth = predictor_depth
@@ -207,12 +208,65 @@ class VolumeMambaJEPA(nn.Module):
     def update_target_encoder(self, m: float = None):
         """EMA update of the target encoder"""
         m = float(m or self.momentum)
-        for ps, pt in zip(self.blocks.parameters(), self.target_blocks.parameters()):
-            pt.data.mul_(m).add_(ps.data, alpha=1 - m)
-        for ps, pt in zip(self.norm_f.parameters(), self.target_norm.parameters()):
-            pt.data.mul_(m).add_(ps.data, alpha=1 - m)
-    
-    
+        src_params = [p.data for p in self.blocks.parameters()] + [p.data for p in self.norm_f.parameters()]
+        tgt_params = [p.data for p in self.target_blocks.parameters()] + [p.data for p in self.target_norm.parameters()]
+        if tgt_params:
+            torch._foreach_mul_(tgt_params, m)
+            torch._foreach_add_(tgt_params, src_params, alpha=1.0 - m)
+
+    def _random_masking_impl(self, x, attn_mask, lengths, mask_ratio):
+        N, Lmax, D = x.shape
+        device = x.device
+        keep_lengths = [max(1, int(Li * (1 - mask_ratio))) if Li > 0 else 0 for Li in lengths]
+        tgt_lengths = [max(0, Li - Lk) for Li, Lk in zip(lengths, keep_lengths)]
+        Lk_max = max(1, max(keep_lengths, default=0))
+        Lt_max = max(tgt_lengths, default=0)
+
+        if Lmax == 0:
+            x_keep = x.new_zeros((N, Lk_max, D))
+            mask_full = torch.ones((N, 0), device=device)
+            ids_restore = torch.empty((N, 0), dtype=torch.long, device=device)
+            attn_keep = torch.ones((N, Lk_max), dtype=torch.bool, device=device)
+            ids_keep_pad = torch.full((N, Lk_max), -1, dtype=torch.long, device=device)
+            ids_tgt = torch.empty((N, 0), dtype=torch.long, device=device)
+            attn_tgt = torch.ones((N, 0), dtype=torch.bool, device=device)
+            return x_keep, mask_full, ids_restore, attn_keep, keep_lengths, ids_keep_pad, ids_tgt, attn_tgt, tgt_lengths
+
+        noise = torch.rand(N, Lmax, device=device)
+        if attn_mask is not None:
+            noise = noise.masked_fill(attn_mask, 2.0)
+        ids_shuffle = torch.argsort(noise, dim=1)
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+        keep_t = torch.tensor(keep_lengths, device=device, dtype=torch.long)
+        ar_k = torch.arange(Lk_max, device=device)[None, :]
+        attn_keep = ar_k >= keep_t[:, None]
+
+        if Lk_max <= Lmax:
+            ids_keep_raw = ids_shuffle[:, :Lk_max]
+        else:
+            ids_keep_raw = F.pad(ids_shuffle, (0, Lk_max - Lmax), value=0)
+        ids_keep_pad = ids_keep_raw.masked_fill(attn_keep, -1)
+
+        x_keep = torch.gather(x, 1, ids_keep_raw.clamp(0, Lmax - 1).unsqueeze(-1).expand(-1, -1, D))
+        x_keep = x_keep.masked_fill(attn_keep.unsqueeze(-1), 0.0)
+
+        ar_l = torch.arange(Lmax, device=device)[None, :]
+        valid_sorted_mask = (ar_l >= keep_t[:, None]).to(torch.float32)
+        mask_full = torch.gather(valid_sorted_mask, 1, ids_restore)
+
+        if Lt_max > 0:
+            tgt_t = torch.tensor(tgt_lengths, device=device, dtype=torch.long)
+            ar_t = torch.arange(Lt_max, device=device)[None, :]
+            attn_tgt = ar_t >= tgt_t[:, None]
+            tgt_pos = (keep_t[:, None] + ar_t).clamp(max=Lmax - 1)
+            ids_tgt = torch.gather(ids_shuffle, 1, tgt_pos)
+        else:
+            attn_tgt = torch.ones((N, 0), dtype=torch.bool, device=device)
+            ids_tgt = torch.empty((N, 0), dtype=torch.long, device=device)
+
+        return x_keep, mask_full, ids_restore, attn_keep, keep_lengths, ids_keep_pad, ids_tgt, attn_tgt, tgt_lengths
+
     def random_masking(self, x, attn_mask, lengths, mask_ratio):
         """
         x: [B, Lmax, D], attn_mask: [B, Lmax] (True=pad), lengths: list[int]
@@ -224,59 +278,9 @@ class VolumeMambaJEPA(nn.Module):
         keep_lengths: list[int]
         ids_keep_pad: [B, Lk_max]  
         """
-        N, Lmax, D = x.shape
-        device = x.device
-
-        x_keep_list, mask_list, ids_restore_list = [], [], []
-        ids_keep_list, keep_lengths, Lk_max = [], [], 0
-
-        for i in range(N):
-            Li = lengths[i]
-            if Li == 0:
-                x_keep_list.append(torch.empty(0, D, device=device, dtype=x.dtype))
-                mask_list.append(torch.ones(Lmax, device=device))
-                ids_restore_list.append(torch.arange(Lmax, device=device))
-                ids_keep_list.append(torch.empty(0, dtype=torch.long, device=device))
-                keep_lengths.append(0)
-                continue
-
-            Lk = max(1, int(Li * (1 - mask_ratio)))
-            keep_lengths.append(Lk)
-            Lk_max = max(Lk_max, Lk)
-
-            noise = torch.rand(Li, device=device)
-            ids_shuffle = torch.argsort(noise)           # [Li]
-            ids_restore_valid = torch.argsort(ids_shuffle)
-            ids_keep = ids_shuffle[:Lk]                 
-
-            x_keep_list.append(x[i, ids_keep])
-            ids_keep_list.append(ids_keep)
-
-            mask_i = torch.ones(Lmax, device=device)
-            valid_mask = torch.ones(Li, device=device)
-            valid_mask[:Lk] = 0
-            mask_i[:Li] = torch.gather(valid_mask, 0, ids_restore_valid)
-            mask_list.append(mask_i)
-
-            ids_restore_full = torch.arange(Lmax, device=device)
-            ids_restore_full[:Li] = ids_restore_valid
-            ids_restore_list.append(ids_restore_full)
-
-        # pad keep tensors
-        x_keep = x.new_zeros((N, max(1, Lk_max), D))
-        ids_keep_pad = torch.full((N, max(1, Lk_max)), -1, dtype=torch.long, device=device)
-        attn_keep = torch.ones(N, max(1, Lk_max), dtype=torch.bool, device=device)
-
-        for i, (xi, ik) in enumerate(zip(x_keep_list, ids_keep_list)):
-            if xi.numel() > 0:
-                Lk = xi.size(0)
-                x_keep[i, :Lk] = xi
-                ids_keep_pad[i, :Lk] = ik
-                attn_keep[i, :Lk] = False
-
-        mask_full = torch.stack(mask_list, dim=0)
-        ids_restore = torch.stack(ids_restore_list, dim=0)
-
+        x_keep, mask_full, ids_restore, attn_keep, keep_lengths, ids_keep_pad, _, _, _ = self._random_masking_impl(
+            x, attn_mask, lengths, mask_ratio
+        )
         return x_keep, mask_full, ids_restore, attn_keep, keep_lengths, ids_keep_pad
 
     def _build_context_visible(self, x_keep, attn_keep):
@@ -314,19 +318,36 @@ class VolumeMambaJEPA(nn.Module):
 
         return x_tgt_pad, attn_tgt, tgt_lengths
 
-    def _run_blocks(self, x, attn_mask, blocks, norm_layer, inference_params=None, unpack_buffer=None):
+    def _run_blocks(self, x, attn_mask, blocks, norm_layer, inference_params=None, unpack_buffer=None, mask_validated: bool = False):
         residual = None
-        # x, seq_idx, idx_info = pack_batch(x, attn_mask)
+        Lmax = x.size(1)
+        if Lmax == 0:
+            return x.new_zeros(x.shape)
+
+        eff_mask = attn_mask
+        pad_right = 0
         hidden_states = x
+        if attn_mask is not None and not mask_validated:
+            assert Mamba._is_right_padded(attn_mask), "attn_mask 必须为右侧 padding（中间不得有 True）"
+            _, L_eff = Mamba._right_pad_lengths(attn_mask)
+            if L_eff == 0:
+                return x.new_zeros(x.shape)
+            if L_eff < Lmax:
+                pad_right = Lmax - L_eff
+                hidden_states = x[:, :L_eff, :]
+                eff_mask = attn_mask[:, :L_eff]
+
         for layer in blocks:
-            hidden_states, residual = layer(
-                hidden_states, residual, inference_params=inference_params,
-                attn_mask=attn_mask
-            )
-            # hidden_states, residual = layer(
-            #     hidden_states, residual, inference_params=inference_params,
-            #     seq_idx=seq_idx
-            # )
+            if eff_mask is not None and isinstance(getattr(layer, "mixer", None), Mamba):
+                hidden_states, residual = layer(
+                    hidden_states, residual, inference_params=inference_params,
+                    attn_mask=eff_mask, validated_mask=True
+                )
+            else:
+                hidden_states, residual = layer(
+                    hidden_states, residual, inference_params=inference_params,
+                    attn_mask=eff_mask
+                )
         fused_norm_available = layer_norm_fn is not None and (
             RMSNorm is None or not isinstance(norm_layer, RMSNorm) or rms_norm_fn is not None
         )
@@ -347,7 +368,10 @@ class VolumeMambaJEPA(nn.Module):
                 residual_in_fp32=self.residual_in_fp32,
                 eps=norm_layer.eps,
             )
-        # hidden_states = unpack_batch(hidden_states, idx_info, unpack_buffer)
+        if pad_right > 0:
+            hidden_states = F.pad(hidden_states, (0, 0, 0, pad_right))
+            if attn_mask is not None:
+                hidden_states = hidden_states.masked_fill(attn_mask.unsqueeze(-1), 0.0)
         return hidden_states
 
     def forward(self, x, mask_ratio=0.6, meta=None, orig_Ts=None, affines=None, inference_params=None, return_moe_features=False):
@@ -355,13 +379,17 @@ class VolumeMambaJEPA(nn.Module):
         x_full, attn_pad, lengths, _ = self.patch_embed(x, meta, orig_Ts, affines, return_grid_info=False)
 
         # random mask
-        x_keep, mask_full, ids_restore, attn_keep, keep_lengths, ids_keep_pad = self.random_masking(x_full, attn_pad, lengths, mask_ratio)
+        x_keep, mask_full, ids_restore, attn_keep, keep_lengths, ids_keep_pad, ids_tgt, attn_tgt, tgt_lengths = self._random_masking_impl(
+            x_full, attn_pad, lengths, mask_ratio
+        )
 
         # build ctx visible
         x_ctx, attn_ctx = self._build_context_visible(x_keep, attn_keep)
-        ctx_keep_out = self._run_blocks(x_ctx, attn_ctx,
+        ctx_keep_out = self._run_blocks(
+            x_ctx, attn_ctx,
             blocks=self.blocks,
             norm_layer=self.norm_f,
+            mask_validated=True,
         ) # [B, Lk_max, D]
 
         device = x_full.device
@@ -371,70 +399,50 @@ class VolumeMambaJEPA(nn.Module):
         if return_moe_features:
             return ctx_keep_out, attn_keep, keep_lengths, meta
 
-        ctx_full = x_full.new_zeros((B, Lmax, D))
-        attn_full = torch.ones(B, Lmax, dtype=torch.bool, device=device)
-        for i in range(B):
-            Li = lengths[i]
-            if Li == 0:
-                continue
+        if Lmax == 0:
+            empty_pred = x_full.new_zeros((B, 0, D))
+            return x_full.new_zeros(()), empty_pred, empty_pred, mask_full
 
-            Lk_i = int((~attn_keep[i]).sum().item())
-            if Lk_i > 0:
-                keep_idx = ids_keep_pad[i, :Lk_i].long()          # [Lk_i]
-                ctx_full[i, keep_idx] = ctx_keep_out[i, :Lk_i]    # [Lk_i, D]
-
-            masked_sel = (mask_full[i, :Li] == 1) if mask_full.dtype != torch.bool else mask_full[i, :Li]
-            if masked_sel.any():
-                idx = torch.nonzero(masked_sel, as_tuple=False).squeeze(1)   # [n_mask]
-                token_rows = self.mask_token_ctx[0, 0].expand(idx.numel(), D)  # [n_mask, D]
-                ctx_full[i, :Li].index_copy_(0, idx, token_rows)
-
-            attn_full[i, :Li] = False
+        ctx_full = self.mask_token_ctx.to(device=device, dtype=ctx_keep_out.dtype).expand(B, Lmax, D).clone()
+        ctx_full = ctx_full.masked_fill(attn_pad.unsqueeze(-1), 0.0)
+        ctx_full_ext = F.pad(ctx_full, (0, 0, 0, 1))
+        safe_ids_keep = ids_keep_pad.masked_fill(attn_keep, Lmax)
+        ctx_full_ext.scatter_(1, safe_ids_keep.unsqueeze(-1).expand(-1, -1, D), ctx_keep_out)
+        ctx_full = ctx_full_ext[:, :Lmax, :]
+        attn_full = attn_pad
 
         pred_full = self._run_blocks(
             ctx_full, attn_full, 
             blocks=self.predictor_blocks,
             norm_layer=self.predictor_norm,
+            mask_validated=True,
         ) # [B, Lmax, D]
 
-        x_tgt_pad, attn_tgt, tgt_lengths = self._build_target_masked(x_full, mask_full, lengths)
+        Lt_max = ids_tgt.size(1)
+        if Lt_max == 0:
+            empty_pred = pred_full.new_zeros((B, 0, D))
+            return pred_full.new_zeros(()), empty_pred, empty_pred, mask_full
+
+        ids_tgt_exp = ids_tgt.unsqueeze(-1).expand(-1, -1, D)
+        x_tgt_pad = torch.gather(x_full, 1, ids_tgt_exp).masked_fill(attn_tgt.unsqueeze(-1), 0.0)
         with torch.no_grad():
             tgt_feat = self._run_blocks(
                 x_tgt_pad, attn_tgt, 
                 blocks=self.target_blocks,
                 norm_layer=self.target_norm,
+                mask_validated=True,
             ) # [B, Lt_max, D]
 
-        Lt_max = x_tgt_pad.size(1)
-        pred_masked = pred_full.new_zeros((B, Lt_max, D))
-        attn_pred = torch.ones(B, Lt_max, dtype=torch.bool, device=device)
-        for i in range(B):
-            Li = lengths[i]
-            if Li == 0:
-                continue
-            sel = (mask_full[i, :Li] == 1) if mask_full.dtype != torch.bool else mask_full[i, :Li]
-            vi = pred_full[i, :Li][sel]
-            if vi.numel() > 0:
-                Lti = vi.size(0)
-                pred_masked[i, :Lti] = vi
-                attn_pred[i, :Lti] = False
+        pred_masked = torch.gather(pred_full, 1, ids_tgt_exp).masked_fill(attn_tgt.unsqueeze(-1), 0.0)
 
         if self.norm_target:
-            # def norm_sg(x, eps=1e-6):
-            #     return x / (x.norm(dim=-1, keepdim=True).clamp_min(eps).detach())
-            # tgt_feat   = norm_sg(tgt_feat)
-            # pred_masked = norm_sg(pred_masked)
             tgt_norm = torch.linalg.norm(tgt_feat, dim=-1, keepdim=True).clamp_min(1e-6)
             tgt_feat = tgt_feat / tgt_norm
             pred_norm = torch.linalg.norm(pred_masked, dim=-1, keepdim=True).clamp_min(1e-6)
             pred_masked = pred_masked / pred_norm
 
-
-        valid = ~attn_pred
-        denom = valid.sum().clamp_min(1)
-        loss = (pred_masked[valid] - tgt_feat[valid]).pow(2).sum() / denom
-
-        loss = loss
-
+        valid = (~attn_tgt).unsqueeze(-1).to(pred_masked.dtype)
+        denom = (~attn_tgt).sum().clamp_min(1)
+        loss = ((pred_masked - tgt_feat) * valid).pow(2).sum() / denom
 
         return loss, pred_masked, tgt_feat, mask_full

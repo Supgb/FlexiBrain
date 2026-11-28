@@ -14,10 +14,13 @@ model:
 data:
   train_list: data/lists/pretrain_train.txt
   val_list: data/lists/pretrain_val.txt
-  batch_size: 4
+  batch_size: 16
   num_workers: 8
-  prefetch_factor: 1
+  prefetch_factor: 2
   persistent_workers: true
+  temporal_fold: true
+  # Set to a local NVMe directory (e.g. /tmp/flexibrain_folded_cache) to sustain >90% GPU util across epochs
+  folded_cache_dir: null
   T_prime: 30
   tau_seconds: 6.0
   default_tr: null
@@ -28,7 +31,7 @@ training:
   warmup_epochs: 3
   mask_ratio: 0.65
   grad_clip: 1.0
-  grad_accumulation_steps: 4
+  grad_accumulation_steps: 1
   seed: 42
   use_amp: true
   amp_dtype: bfloat16

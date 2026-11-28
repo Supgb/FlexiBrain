@@ -148,72 +148,96 @@ class STAPE4D_TimeToSpace(nn.Module):
 
         return tokens_with_pos, pos_encoding
 
-    def _run_group_time_first(self,
-                              x_group: torch.Tensor,            # [G,96,96,96,T_max]
-                              orig_Ts: List[int],               
-                              kt:int, kx:int, ky:int, kz:int,
-                              group_idxs: List[int],          
-                              affines: List[torch.Tensor],    
-                              return_grid_info: bool = False) -> Tuple[List[torch.Tensor], List[int], Dict]:
-        device, dtype = x_group.device, x_group.dtype
-        G, X, Y, Z, T_max = x_group.shape
-        assert X==96 and Y==96 and Z==96
+    def _run_group_from_folded(self,
+                               fg: torch.Tensor,            # [G, kt, 96, 96, 96] (X, Y, Z)
+                               nz_g: torch.Tensor,          # [G, 96, 96, 96] bool
+                               orig_Ts: List[int],
+                               kt: int, kx: int, ky: int, kz: int,
+                               group_idxs: List[int],
+                               affines: List[torch.Tensor],
+                               return_grid_info: bool = False) -> Tuple[List[torch.Tensor], List[int], Dict, List[torch.Tensor]]:
+        device, dtype = fg.device, fg.dtype
+        G, _, X, Y, Z = fg.shape
+        assert X == 96 and Y == 96 and Z == 96
+        Lx, Ly, Lz = X // kx, Y // ky, Z // kz
 
-        T_true_max = max(orig_Ts) if len(orig_Ts)>0 else 0
-        T_pad = math.ceil(T_true_max / kt) * kt
-        T_prime = T_pad // kt   
+        grid_data = {}
+        if max((int(t) for t in orig_Ts), default=0) <= 0:
+            if return_grid_info:
+                empty_mask = torch.zeros(Lx * Ly * Lz, dtype=torch.bool)
+                empty_idx = torch.empty(0, dtype=torch.long)
+                for sample_idx in group_idxs:
+                    grid_data[sample_idx] = {
+                        'Lx': Lx, 'Ly': Ly, 'Lz': Lz,
+                        'kx': kx, 'ky': ky, 'kz': kz,
+                        'keep_mask': empty_mask.clone(),
+                        'grid_to_token_idx': empty_idx.clone(),
+                    }
+            return (
+                [fg.new_zeros((0, self.Do)) for _ in range(G)],
+                [0] * G,
+                grid_data,
+                [fg.new_zeros((0, self.Do)) for _ in range(G)],
+            )
 
-        w_t = self._get_wt_first(kt, device, dtype)   # [Dm,1,kt]
+        w_t = self._get_wt_first(kt, device, dtype).squeeze(1)             # [Dm, kt]
+        w_xyz = self._get_wxyz_after(kx, ky, kz, device, dtype)            # [Do, Dm, kx, ky, kz]
+        b_t = self.b_t_first.to(device=device, dtype=dtype)                # [Dm]
+        b_xyz = self.b_xyz_after.to(device=device, dtype=dtype)            # [Do]
 
-        xg = x_group.clone()
-        if T_max < T_pad:
-            pad_len = T_pad - T_max
-            xg = F.pad(xg, (0, pad_len), mode='constant', value=0.0)  # [G,96,96,96,T_pad]
-        xg = xg[..., :T_pad]
+        # Algebraically fuse temporal conv1d + spatial conv3d over folded windows.
+        W_eff = torch.einsum("odxyz,dk->okxyz", w_xyz, w_t)                # [Do, kt, kx, ky, kz]
+        bias_t = torch.einsum("od,d->o", w_xyz.sum(dim=(2, 3, 4)), b_t)    # [Do]
+        sfeat = F.conv3d(fg.contiguous(), W_eff, bias=b_xyz, stride=(kx, ky, kz))
 
-        xlin = xg.permute(0,1,2,3,4).contiguous().view(G*X*Y*Z, 1, T_pad)
-        b_t_first = self.b_t_first.to(device=device, dtype=dtype)
-        tfeat = F.conv1d(xlin, w_t, bias=b_t_first, stride=kt)  # [N, Dm, T′]
-        tfeat = tfeat.view(G, X, Y, Z, self.Dm, T_prime).permute(0,4,5,1,2,3).contiguous()
-        # Ignore fully padded windows, including their temporal convolution bias.
         valid_windows = torch.tensor(
-            [(int(t) + kt - 1) // kt for t in orig_Ts], device=device
+            [(int(t) + kt - 1) // kt if int(t) > 0 else 0 for t in orig_Ts],
+            device=device,
+            dtype=sfeat.dtype,
         )
-        window_mask = torch.arange(T_prime, device=device)[None, :] < valid_windows[:, None]
-        tfeat = tfeat.masked_fill(~window_mask[:, None, :, None, None, None], 0.0)
-        x_sp_in = tfeat.view(G, self.Dm*T_prime, X, Y, Z)  # [G, C_in, X,Y,Z]
+        sfeat = sfeat + valid_windows[:, None, None, None, None] * bias_t.to(sfeat.dtype)[None, :, None, None, None]
 
-        w_xyz = self._get_wxyz_after(kx,ky,kz, device, dtype)   # [Do, Dm, kx,ky,kz]
-        # Flattened channel d*T_prime+t must always use spatial kernel d.
-        w_xyz_rep = w_xyz.repeat_interleave(T_prime, dim=1)   # [Do, Dm*T′, kx,ky,kz]
-        b_xyz_after = self.b_xyz_after.to(device=device, dtype=dtype)
-        sfeat = F.conv3d(x_sp_in, w_xyz_rep, bias=b_xyz_after, stride=(kx,ky,kz))  # [G, Do, Lx,Ly,Lz]
-
-        Lx, Ly, Lz = X//kx, Y//ky, Z//kz
-        tokens_all = sfeat.permute(0,2,3,4,1).contiguous().view(G, Lx*Ly*Lz, self.Do)
+        tokens_all = sfeat.permute(0, 2, 3, 4, 1).contiguous().view(G, Lx * Ly * Lz, self.Do)
 
         if affines is not None and len(affines) == len(group_idxs):
             tokens_all, pos_group = self._add_positional_encoding(tokens_all, group_idxs, affines, kx, ky, kz)
+        else:
+            pos_group = torch.zeros_like(tokens_all)
+
+        vol = nz_g[:, :Lx * kx, :Ly * ky, :Lz * kz].unsqueeze(1).float()   # [G, 1, X', Y', Z']
+        keep_masks = (F.max_pool3d(vol, kernel_size=(kx, ky, kz), stride=(kx, ky, kz)) > 0).view(G, -1)
+        for g in range(G):
+            if int(orig_Ts[g]) <= 0:
+                keep_masks[g].zero_()
+
+        g_lens = keep_masks.sum(dim=1).tolist()
+        max_g_len = max(g_lens) if g_lens else 0
+
+        if max_g_len > 0:
+            order = (~keep_masks).to(torch.int32).argsort(dim=1, stable=True)[:, :max_g_len]
+            idx_exp = order.unsqueeze(-1).expand(-1, -1, self.Do)
+            gathered_tok = torch.gather(tokens_all, 1, idx_exp)
+            gathered_pos = torch.gather(pos_group, 1, idx_exp)
+        else:
+            gathered_tok = None
+            gathered_pos = None
 
         tokens_list, lengths, pos_list = [], [], []
-        grid_data = {}
-
         for g in range(G):
-            T_true = orig_Ts[g]
-
-            keep_mask = self._spatial_keep_mask_alltime(x_group[g], kx,ky,kz, T_true)  # [Lx*Ly*Lz]
-            if keep_mask.any():
-                toks = tokens_all[g][keep_mask]   # [N_valid, Do]
-                pe = pos_group[g][keep_mask]
+            ln = int(g_lens[g])
+            if ln > 0:
+                toks = gathered_tok[g, :ln]
+                pe = gathered_pos[g, :ln]
             else:
-                toks = tokens_all[g].new_zeros((0, self.Do))
-                pe = pos_group[g].new_zeros((0, self.Do))
+                toks = tokens_all.new_zeros((0, self.Do))
+                pe = pos_group.new_zeros((0, self.Do))
 
             tokens_list.append(toks)
             pos_list.append(pe)
-            lengths.append(int(toks.size(0)))
+            lengths.append(ln)
 
             if return_grid_info:
+                keep_mask = keep_masks[g]
                 sample_idx = group_idxs[g]
                 grid_data[sample_idx] = {
                     'Lx': Lx,
@@ -222,11 +246,52 @@ class STAPE4D_TimeToSpace(nn.Module):
                     'kx': kx,
                     'ky': ky,
                     'kz': kz,
-                    'keep_mask': keep_mask.cpu(),  # [Lx*Ly*Lz] bool
-                    'grid_to_token_idx': torch.nonzero(keep_mask, as_tuple=False).squeeze(-1).cpu(),  
+                    'keep_mask': keep_mask.cpu(),
+                    'grid_to_token_idx': torch.nonzero(keep_mask, as_tuple=False).squeeze(-1).cpu(),
                 }
 
         return tokens_list, lengths, grid_data, pos_list
+
+    def _run_group_time_first(self,
+                              x_group: torch.Tensor,            # [G,96,96,96,T_max]
+                              orig_Ts: List[int],               
+                              kt:int, kx:int, ky:int, kz:int,
+                              group_idxs: List[int],          
+                              affines: List[torch.Tensor],    
+                              return_grid_info: bool = False) -> Tuple[List[torch.Tensor], List[int], Dict, List[torch.Tensor]]:
+        device, dtype = x_group.device, x_group.dtype
+        G, X, Y, Z, T_max = x_group.shape
+        assert X == 96 and Y == 96 and Z == 96
+
+        T_true_max = max((int(t) for t in orig_Ts), default=0)
+        if T_true_max <= 0:
+            fg = x_group.new_zeros((G, kt, X, Y, Z))
+            nz_g = torch.zeros((G, X, Y, Z), dtype=torch.bool, device=device)
+            return self._run_group_from_folded(
+                fg, nz_g, orig_Ts, kt, kx, ky, kz, group_idxs, affines,
+                return_grid_info=return_grid_info,
+            )
+
+        T_pad = math.ceil(T_true_max / kt) * kt
+        T_prime = T_pad // kt
+
+        if T_max < T_pad:
+            xg = F.pad(x_group, (0, T_pad - T_max), mode='constant', value=0.0)
+        else:
+            xg = x_group[..., :T_pad]
+
+        if not all(int(t) == T_pad for t in orig_Ts):
+            t_valid = torch.arange(T_pad, device=device)[None, :] < torch.tensor(
+                [int(t) for t in orig_Ts], device=device
+            )[:, None]
+            xg = xg * t_valid[:, None, None, None, :].to(xg.dtype)
+
+        fg = xg.view(G, X, Y, Z, T_prime, kt).sum(dim=4).permute(0, 4, 1, 2, 3)  # [G, kt, X, Y, Z]
+        nz_g = (xg != 0).any(dim=-1)  # [G, X, Y, Z]
+        return self._run_group_from_folded(
+            fg, nz_g, orig_Ts, kt, kx, ky, kz, group_idxs, affines,
+            return_grid_info=return_grid_info,
+        )
     
     def forward(self,
                 x: torch.Tensor,                     
@@ -237,7 +302,11 @@ class STAPE4D_TimeToSpace(nn.Module):
         B = x.size(0)
         device, dtype = x.device, x.dtype
 
+        folded_info = meta.get("_stape_folded") if isinstance(meta, dict) else None
+
         if orig_Ts is None:
+            if folded_info is not None:
+                raise ValueError("orig_Ts is required when using pre-folded STAPE inputs")
             orig_Ts = [self._detect_true_T(x[b]) for b in range(B)]
         else:
             orig_Ts = [int(t) for t in orig_Ts]
@@ -252,25 +321,53 @@ class STAPE4D_TimeToSpace(nn.Module):
         for i in range(B):
             voxel = tuple(meta[i]["voxel"])
             tr = float(meta[i]["tr"])
-            group_key = (voxel, tr)
+            group_key = self._k_from_meta(tr, voxel)
             groups[group_key].append(i)
+
+        if folded_info is not None:
+            layout = folded_info.get("layout", "kzyx")
+            nz_all = folded_info["nonzero_mask"]
+            if layout == "kzyx":
+                x_kxyz = x.permute(0, 1, 4, 3, 2)
+                nz_xyz = nz_all.permute(0, 3, 2, 1)
+            elif layout == "kxyz":
+                x_kxyz = x
+                nz_xyz = nz_all
+            else:
+                raise ValueError(f"Unsupported folded STAPE layout: {layout!r}")
+            folded_kts = folded_info["folded_kt"]
 
         per_sample_tokens: List[torch.Tensor] = [None]*B
         per_sample_pos:    List[torch.Tensor] = [None]*B
         lengths: List[int] = [0]*B
         grid_info: Dict[int, Dict] = {}  
 
-        for (voxel, tr), idxs in groups.items():
-            kt, kx, ky, kz = self._k_from_meta(tr, voxel)
+        for (kt, kx, ky, kz), idxs in groups.items():
+            Ts_group = [orig_Ts[i] for i in idxs]
+            affines_group = [affines[i] for i in idxs]
 
-            x_group = x[idxs, ...]                              # [G,96,96,96,T_max]
-            Ts_group = [orig_Ts[i] for i in idxs]               
-            affines_group = [affines[i] for i in idxs]          
-
-            toks, lens, grid_data, pos_list = self._run_group_time_first(
-                x_group, Ts_group, kt, kx, ky, kz, idxs, affines_group,
-                return_grid_info=return_grid_info
-            )
+            if folded_info is not None:
+                for i in idxs:
+                    if int(folded_kts[i]) != kt:
+                        raise ValueError(
+                            f"Folded sample kt={int(folded_kts[i])} does not match STAPE kt={kt} "
+                            f"(tr={meta[i]['tr']}, tau={self.tau})"
+                        )
+                toks, lens, grid_data, pos_list = self._run_group_from_folded(
+                    x_kxyz[idxs, :kt],
+                    nz_xyz[idxs],
+                    Ts_group,
+                    kt, kx, ky, kz,
+                    idxs,
+                    affines_group,
+                    return_grid_info=return_grid_info,
+                )
+            else:
+                x_group = x[idxs, ...]                              # [G,96,96,96,T_max]
+                toks, lens, grid_data, pos_list = self._run_group_time_first(
+                    x_group, Ts_group, kt, kx, ky, kz, idxs, affines_group,
+                    return_grid_info=return_grid_info
+                )
             for g_idx, (tok, ln) in enumerate(zip(toks, lens)):
                 loc = idxs[g_idx]
                 per_sample_tokens[loc] = tok
@@ -280,8 +377,9 @@ class STAPE4D_TimeToSpace(nn.Module):
                     grid_info[loc] = grid_data[loc]
 
         L_max = max(lengths) if lengths else 0
-        out = x.new_zeros((B, L_max, self.Do))
-        pos_out    = x.new_zeros((B, L_max, self.Do))
+        out_dtype = next((t.dtype for t in per_sample_tokens if t is not None and t.numel() > 0), dtype)
+        out = torch.zeros((B, L_max, self.Do), device=device, dtype=out_dtype)
+        pos_out = torch.zeros((B, L_max, self.Do), device=device, dtype=out_dtype)
         attn_mask = torch.ones((B, L_max), dtype=torch.bool, device=device)
 
         for b, tok in enumerate(per_sample_tokens):

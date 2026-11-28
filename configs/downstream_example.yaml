@@ -23,10 +23,13 @@ data:
   label_column: Group_idx
   label_mode: multiclass
   path_id_mode: auto
-  batch_size: 4
+  batch_size: 16
   num_workers: 8
-  prefetch_factor: 1
+  prefetch_factor: 2
   persistent_workers: true
+  temporal_fold: true
+  # Set to a local NVMe directory (e.g. /tmp/flexibrain_folded_cache) to sustain high GPU util across epochs
+  folded_cache_dir: null
   T_prime: 30
   tau_seconds: 6.0
   default_tr: null
@@ -38,7 +41,7 @@ training:
   weight_decay: 0.05
   warmup_epochs: 2
   selection_metric: val_auroc
-  grad_accumulation_steps: 4
+  grad_accumulation_steps: 1
   grad_clip: 1.0
   seed: 42
   use_amp: true

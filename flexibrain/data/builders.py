@@ -23,8 +23,28 @@ def _dataloader_worker_kwargs(data: DataConfig, *, allow_persistent: bool) -> di
 
 
 def build_pretrain_dataloaders(data: DataConfig, training: TrainingConfig, rank: int = 0, world_size: int = 1) -> Tuple[DataLoader, DataLoader]:
-    train_set = NiftiTxtDataset(data.train_list, return_torch=True, memory_map=data.memory_map, cache_meta=True, T_prime=data.T_prime, tau_seconds=data.tau_seconds, default_tr=data.default_tr)
-    val_set = NiftiTxtDataset(data.val_list, return_torch=True, memory_map=data.memory_map, cache_meta=True, T_prime=data.T_prime, tau_seconds=data.tau_seconds, default_tr=data.default_tr)
+    train_set = NiftiTxtDataset(
+        data.train_list,
+        return_torch=True,
+        memory_map=data.memory_map,
+        cache_meta=True,
+        T_prime=data.T_prime,
+        tau_seconds=data.tau_seconds,
+        default_tr=data.default_tr,
+        temporal_fold=data.temporal_fold,
+        folded_cache_dir=data.folded_cache_dir,
+    )
+    val_set = NiftiTxtDataset(
+        data.val_list,
+        return_torch=True,
+        memory_map=data.memory_map,
+        cache_meta=True,
+        T_prime=data.T_prime,
+        tau_seconds=data.tau_seconds,
+        default_tr=data.default_tr,
+        temporal_fold=data.temporal_fold,
+        folded_cache_dir=data.folded_cache_dir,
+    )
     train_sampler = DistributedSampler(train_set, num_replicas=world_size, rank=rank, shuffle=True, seed=training.seed) if world_size > 1 else None
     val_sampler = DistributedSampler(val_set, num_replicas=world_size, rank=rank, shuffle=False, seed=training.seed) if world_size > 1 else None
     train_worker_kwargs = _dataloader_worker_kwargs(data, allow_persistent=True)
@@ -53,6 +73,8 @@ def _classification_dataset(txt_file: Optional[str], data: DataConfig):
         T_prime=data.T_prime,
         tau_seconds=data.tau_seconds,
         default_tr=data.default_tr,
+        temporal_fold=data.temporal_fold,
+        folded_cache_dir=data.folded_cache_dir,
     )
 
 

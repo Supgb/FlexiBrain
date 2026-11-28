@@ -249,9 +249,9 @@ def custom_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     For variable-length data, we pad to the maximum length in the batch.
     """
-    # Separate tensor/array fields from non-collatable fields
-    tensor_fields = ['data', 'affine']
-    scalar_fields = ['tr', 'subject_idx', 'T_selected', 'T_prime', 'tau_seconds', 'label']
+    is_folded = "folded_kt" in batch[0]
+    tensor_fields = ['data', 'nonzero_mask', 'affine'] if is_folded else ['data', 'affine']
+    scalar_fields = ['tr', 'subject_idx', 'T_selected', 'T_prime', 'tau_seconds', 'folded_kt', 'label']
     tuple_fields = ['voxel']
     object_fields = ['header', 'path']  # These won't be collated
 
@@ -263,20 +263,32 @@ def custom_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
             values = [item[field] for item in batch]
 
             if field == 'data':
-                # Data has variable time dimension due to different TR values
-                # Pad all to the maximum time length
-                max_t = max(v.shape[-1] if len(v.shape) >= 4 else 1 for v in values)
+                if is_folded:
+                    max_kt = max(v.shape[0] for v in values)
+                    padded_values = []
+                    for v in values:
+                        if v.shape[0] < max_kt:
+                            pad_kt = max_kt - v.shape[0]
+                            if isinstance(v, torch.Tensor):
+                                v = torch.nn.functional.pad(v, (0, 0, 0, 0, 0, 0, 0, pad_kt), mode='constant', value=0)
+                            else:
+                                v = np.pad(v, ((0, pad_kt), (0, 0), (0, 0), (0, 0)), mode='constant', constant_values=0)
+                        padded_values.append(v)
+                else:
+                    # Data has variable time dimension due to different TR values
+                    # Pad all to the maximum time length
+                    max_t = max(v.shape[-1] if len(v.shape) >= 4 else 1 for v in values)
 
-                padded_values = []
-                for v in values:
-                    if len(v.shape) >= 4 and v.shape[-1] < max_t:
-                        # Pad in time dimension (last dimension)
-                        pad_amount = max_t - v.shape[-1]
-                        if isinstance(v, torch.Tensor):
-                            v = torch.nn.functional.pad(v, (0, pad_amount), mode='constant', value=0)
-                        else:
-                            v = np.pad(v, ((0, 0), (0, 0), (0, 0), (0, pad_amount)), mode='constant', constant_values=0)
-                    padded_values.append(v)
+                    padded_values = []
+                    for v in values:
+                        if len(v.shape) >= 4 and v.shape[-1] < max_t:
+                            # Pad in time dimension (last dimension)
+                            pad_amount = max_t - v.shape[-1]
+                            if isinstance(v, torch.Tensor):
+                                v = torch.nn.functional.pad(v, (0, pad_amount), mode='constant', value=0)
+                            else:
+                                v = np.pad(v, ((0, 0), (0, 0), (0, 0), (0, pad_amount)), mode='constant', constant_values=0)
+                        padded_values.append(v)
 
                 # Convert to tensor and stack
                 if isinstance(padded_values[0], torch.Tensor):
@@ -284,7 +296,6 @@ def custom_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
                 else:
                     collated[field] = torch.from_numpy(np.stack(padded_values))
             else:
-                # Affine matrices should all be the same size (4x4)
                 if isinstance(values[0], torch.Tensor):
                     collated[field] = torch.stack(values)
                 else:
@@ -295,7 +306,8 @@ def custom_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         if field in batch[0]:
             values = [item[field] for item in batch]
             if isinstance(values[0], (int, float)):
-                collated[field] = torch.tensor(values)
+                dtype = torch.long if field == 'folded_kt' else None
+                collated[field] = torch.tensor(values, dtype=dtype)
             else:
                 collated[field] = values
 
@@ -315,14 +327,14 @@ def prepare_batch_data(batch: Dict, device: torch.device) -> Tuple[torch.Tensor,
     """Prepare batch data for model forward pass.
 
     Returns:
-        x: Input tensor (B, 96, 96, 96, T_max)
-        meta: Dict {batch_index: {"voxel": (vx, vy, vz), "tr": float}}
+        x: Input tensor (B, 96, 96, 96, T_max) or folded (B, kt_max, Z, Y, X)
+        meta: Dict {batch_index: {"voxel": (vx, vy, vz), "tr": float}} (plus optional _stape_folded)
         orig_Ts: Array of original time steps
         labels: Classification labels
         affines: Affine matrices or None
     """
     # Data is already padded and stacked by custom_collate_fn
-    x = batch['data'].to(device, dtype=torch.float32)
+    x = batch['data'].to(device, dtype=torch.float32, non_blocking=True)
 
     # Build meta dict - use batch index as key
     batch_size = x.shape[0]
@@ -335,7 +347,7 @@ def prepare_batch_data(batch: Dict, device: torch.device) -> Tuple[torch.Tensor,
     elif isinstance(trs, list):
         trs = np.array(trs)
 
-    meta = {}
+    meta: Dict[Any, Any] = {}
     for i in range(batch_size):
         # Get voxel
         if isinstance(voxels, list):
@@ -355,6 +367,15 @@ def prepare_batch_data(batch: Dict, device: torch.device) -> Tuple[torch.Tensor,
 
         meta[i] = {"voxel": voxel, "tr": tr}
 
+    if 'nonzero_mask' in batch and 'folded_kt' in batch:
+        folded_kt = batch['folded_kt']
+        kt_list = folded_kt.tolist() if isinstance(folded_kt, torch.Tensor) else [int(k) for k in folded_kt]
+        meta['_stape_folded'] = {
+            'nonzero_mask': batch['nonzero_mask'].to(device, dtype=torch.bool, non_blocking=True),
+            'folded_kt': kt_list,
+            'layout': 'kzyx',
+        }
+
     # Get original time steps (T_selected from dataset)
     orig_Ts = batch.get('T_selected', x.shape[-1])
     if isinstance(orig_Ts, torch.Tensor):
@@ -365,11 +386,11 @@ def prepare_batch_data(batch: Dict, device: torch.device) -> Tuple[torch.Tensor,
     # Handle labels
     labels = batch['label']
     if isinstance(labels, torch.Tensor):
-        labels = labels.to(device, dtype=torch.long)
+        labels = labels.to(device, dtype=torch.long, non_blocking=True)
     else:
         labels = torch.tensor(labels, dtype=torch.long, device=device)
 
     # Get affines if available
-    affines = batch['affine'].to(device, dtype=torch.float32) if 'affine' in batch else None
+    affines = batch['affine'].to(device, dtype=torch.float32, non_blocking=True) if 'affine' in batch else None
 
     return x, meta, orig_Ts, labels, affines

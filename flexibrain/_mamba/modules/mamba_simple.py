@@ -349,6 +349,7 @@ class Mamba(nn.Module):
         hidden_states: Tensor,                      # (B, Lmax, D)
         inference_params=None,
         attn_mask: Optional[Tensor] = None,         # (B, Lmax) True=PAD（右侧）
+        validated_mask: bool = False,
     ) -> Tensor:
         """
         并行计算；为 PAD 付费，但：
@@ -361,6 +362,11 @@ class Mamba(nn.Module):
 
         # 训练/前向（带 mask）不应使用流式缓存
         assert inference_params is None, "变长/带 mask 训练前向请使用 inference_params=None"
+
+        if validated_mask:
+            y = self.forward_dense(hidden_states, None)
+            y.masked_fill_(attn_mask.unsqueeze(-1), 0.0)
+            return y
 
         # 仅支持右侧 pad（你的场景）
         assert self._is_right_padded(attn_mask), "attn_mask 必须为右侧 padding（中间不得有 True）"

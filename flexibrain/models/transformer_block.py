@@ -11,6 +11,7 @@ vendored into Flexibrain.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def drop_path(x, drop_prob: float = 0.0, training: bool = False):
@@ -65,15 +66,29 @@ class Attention(nn.Module):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        if attention_mask is not None:
-            valid = attention_mask.bool()
-            key_mask = ~valid[:, None, None, :]
-            attn = attn.masked_fill(key_mask, torch.finfo(attn.dtype).min)
-        attn = self.attn_drop(attn.softmax(dim=-1))
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        if output_attentions:
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            if attention_mask is not None:
+                valid = attention_mask.bool()
+                key_mask = ~valid[:, None, None, :]
+                attn = attn.masked_fill(key_mask, torch.finfo(attn.dtype).min)
+            attn = self.attn_drop(attn.softmax(dim=-1))
+            x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+            x = self.proj_drop(self.proj(x))
+            return x, attn
+
+        sdpa_mask = attention_mask.bool()[:, None, None, :] if attention_mask is not None else None
+        x = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=sdpa_mask,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+            scale=self.scale,
+        )
+        x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj_drop(self.proj(x))
-        return (x, attn) if output_attentions else (x, None)
+        return x, None
 
 
 class Block(nn.Module):

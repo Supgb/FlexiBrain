@@ -83,7 +83,8 @@ class MambaJEPAClassifier(nn.Module):
             xf, attn_pad,
             blocks=self.backbone.blocks,
             norm_layer=self.backbone.norm_f,
-            inference_params=inference_params
+            inference_params=inference_params,
+            mask_validated=True,
         )
         return feat, attn_pad
 
@@ -94,7 +95,8 @@ class MambaJEPAClassifier(nn.Module):
             xf, attn_pad,
             blocks=self.backbone.blocks,
             norm_layer=self.backbone.norm_f,
-            inference_params=inference_params
+            inference_params=inference_params,
+            mask_validated=True,
         )
 
         return feat, attn_pad
@@ -190,7 +192,8 @@ class MambaJEPAClassifierAvgPool(nn.Module):
             xf, attn_pad,
             blocks=self.backbone.blocks,
             norm_layer=self.backbone.norm_f,
-            inference_params=inference_params
+            inference_params=inference_params,
+            mask_validated=True,
         )
         return feat, attn_pad
 

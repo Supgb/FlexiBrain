@@ -57,6 +57,8 @@ class DataConfig:
     prefetch_factor: Optional[int] = 1
     persistent_workers: bool = True
     memory_map: bool = True
+    temporal_fold: bool = True
+    folded_cache_dir: Optional[str] = None
     T_prime: int = 30
     tau_seconds: float = 6.0
     default_tr: Optional[float] = None
@@ -87,6 +89,7 @@ class LoggingConfig:
     checkpoint_dir: str = "./checkpoints"
     log_dir: str = "./logs"
     resume: Optional[str] = None
+    async_checkpoint: bool = False
 
 
 @dataclass

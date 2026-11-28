@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import threading
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -21,6 +22,7 @@ from sklearn.metrics import (
 from flexibrain.config import RunConfig
 from flexibrain.data import build_downstream_dataloaders
 from flexibrain.data.classification import prepare_batch_data
+from flexibrain.engine.pretrainer import _to_cpu_snapshot, _write_checkpoint
 from flexibrain.models import build_downstream_model
 from flexibrain.utils.logging import setup_logger
 from flexibrain.utils.seed import set_seed
@@ -35,6 +37,13 @@ class DownstreamTrainer:
         self.rank = cfg.training.local_rank
         self.device = torch.device(f"cuda:{self.rank}" if torch.cuda.is_available() else "cpu")
         self.logger = setup_logger("downstream", cfg.logging.log_dir, rank=self.rank)
+        self._save_thread: Optional[threading.Thread] = None
+
+    def _wait_for_save(self) -> None:
+        thread = getattr(self, "_save_thread", None)
+        if thread is not None:
+            thread.join()
+            self._save_thread = None
 
     def _validate_selection_metric(self) -> str:
         metric = self.cfg.training.selection_metric
@@ -62,13 +71,14 @@ class DownstreamTrainer:
             self.optimizer = optim.AdamW([
                 {"params": backbone_params, "lr": self.cfg.training.lr_backbone or self.cfg.training.lr},
                 {"params": head_params, "lr": self.cfg.training.lr_head or self.cfg.training.lr},
-            ], betas=(0.9, 0.999), weight_decay=self.cfg.training.weight_decay)
+            ], betas=(0.9, 0.999), weight_decay=self.cfg.training.weight_decay, fused=(self.device.type == "cuda"))
         else:
             self.optimizer = optim.AdamW(
                 self.model.parameters(),
                 lr=self.cfg.training.lr,
                 betas=(0.9, 0.999),
                 weight_decay=self.cfg.training.weight_decay,
+                fused=(self.device.type == "cuda"),
             )
         self.use_amp = bool(self.cfg.training.use_amp and self.device.type == "cuda")
         self.amp_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[self.cfg.training.amp_dtype]
@@ -102,7 +112,7 @@ class DownstreamTrainer:
     def train_one_epoch(self, epoch: int) -> float:
         self.model.train()
         criterion = nn.CrossEntropyLoss()
-        total_loss = 0.0
+        total_loss = torch.zeros((), device=self.device, dtype=torch.float64)
         num_batches = 0
         accum = max(1, int(self.cfg.training.grad_accumulation_steps))
         self.optimizer.zero_grad(set_to_none=True)
@@ -114,7 +124,7 @@ class DownstreamTrainer:
             self.scaler.scale(loss / accum).backward()
             if (batch_idx + 1) % accum == 0:
                 self._optimizer_step()
-            total_loss += float(loss.item())
+            total_loss += loss.detach().to(torch.float64)
             num_batches += 1
             if self.rank == 0 and (batch_idx + 1) % self.cfg.logging.log_interval == 0:
                 current_lr = self.optimizer.param_groups[0]["lr"]
@@ -123,35 +133,40 @@ class DownstreamTrainer:
                     epoch + 1,
                     batch_idx + 1,
                     len(self.train_loader),
-                    loss.item(),
+                    float(loss.detach().item()),
                     current_lr,
                 )
         if num_batches % accum != 0:
             self._optimizer_step()
-        return total_loss / max(1, num_batches)
+        return float(total_loss.item()) / max(1, num_batches)
 
     @torch.no_grad()
     def evaluate(self, loader, split_name: str) -> Dict[str, Optional[float]]:
         self.model.eval()
         criterion = nn.CrossEntropyLoss(reduction="sum")
-        preds, labels_all, probs_all = [], [], []
-        total_loss = 0.0
+        probs_list, preds_list, labels_list = [], [], []
+        total_loss = torch.zeros((), device=self.device, dtype=torch.float64)
         num_samples = 0
         for batch in loader:
             x, meta, orig_Ts, labels, affines = prepare_batch_data(batch, self.device)
             with torch.autocast(device_type=self.device.type, dtype=getattr(self, "amp_dtype", torch.float16), enabled=self.use_amp):
                 logits = self.model(x, meta=meta, orig_Ts=orig_Ts, affines=affines)
                 loss = criterion(logits, labels)
-            total_loss += float(loss.item())
+            total_loss += loss.detach().to(torch.float64)
             num_samples += int(labels.size(0))
-            probs_batch = torch.softmax(logits.float(), dim=1).cpu().numpy()
-            probs_all.append(probs_batch)
-            preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
-            labels_all.extend(labels.cpu().numpy())
+            probs_list.append(torch.softmax(logits.detach().float(), dim=1))
+            preds_list.append(torch.argmax(logits.detach(), dim=1))
+            labels_list.append(labels.detach())
 
-        labels_arr = np.asarray(labels_all)
-        preds_arr = np.asarray(preds)
-        probs_arr = np.concatenate(probs_all, axis=0) if probs_all else np.empty((0, 0), dtype=np.float32)
+        total_loss_val = float(total_loss.item())
+        if probs_list:
+            probs_arr = torch.cat(probs_list, dim=0).cpu().numpy()
+            preds_arr = torch.cat(preds_list, dim=0).cpu().numpy()
+            labels_arr = torch.cat(labels_list, dim=0).cpu().numpy()
+        else:
+            probs_arr = np.empty((0, 0), dtype=np.float32)
+            preds_arr = np.empty((0,), dtype=np.int64)
+            labels_arr = np.empty((0,), dtype=np.int64)
 
         auroc: Optional[float] = None
         if len(labels_arr) > 0 and probs_arr.ndim == 2:
@@ -168,7 +183,7 @@ class DownstreamTrainer:
                 auroc = None
 
         metrics: Dict[str, Optional[float]] = {
-            "loss": total_loss / max(1, num_samples),
+            "loss": total_loss_val / max(1, num_samples),
             "accuracy": float(accuracy_score(labels_arr, preds_arr)) if len(labels_arr) > 0 else 0.0,
             "balanced_accuracy": float(balanced_accuracy_score(labels_arr, preds_arr)) if len(labels_arr) > 0 else 0.0,
             "auroc": auroc,
@@ -233,9 +248,19 @@ class DownstreamTrainer:
             "best_is_fallback": best_is_fallback,
             "config": vars(self.cfg.model),
         }
-        torch.save(payload, os.path.join(self.cfg.logging.checkpoint_dir, "downstream_latest.pt"))
-        if is_best:
-            torch.save(payload, os.path.join(self.cfg.logging.checkpoint_dir, "downstream_best.pt"))
+        latest_path = os.path.join(self.cfg.logging.checkpoint_dir, "downstream_latest.pt")
+        best_path = os.path.join(self.cfg.logging.checkpoint_dir, "downstream_best.pt") if is_best else None
+        if getattr(self.cfg.logging, "async_checkpoint", False):
+            self._wait_for_save()
+            cpu_payload = _to_cpu_snapshot(payload)
+            self._save_thread = threading.Thread(
+                target=_write_checkpoint,
+                args=(cpu_payload, latest_path, best_path),
+                daemon=True,
+            )
+            self._save_thread.start()
+        else:
+            _write_checkpoint(payload, latest_path, best_path)
 
     def _resume(self) -> Tuple[int, Tuple[int, float], Optional[float]]:
         selection_metric = self._validate_selection_metric()
@@ -313,42 +338,46 @@ class DownstreamTrainer:
         warned_auroc_fallback = False
         if self.cfg.logging.resume:
             start_epoch, best_key, best_display = self._resume()
-        for epoch in range(start_epoch, self.cfg.training.epochs):
-            train_loss = self.train_one_epoch(epoch)
-            val_metrics = self.evaluate(self.val_loader, "Validation")
-            metrics = {"val": val_metrics, "train_loss": train_loss}
-            prio, comp, disp = self._selection_candidate(val_metrics, selection_metric)
-            if selection_metric == "val_auroc" and prio == 0 and not warned_auroc_fallback and self.rank == 0:
-                self.logger.warning(
-                    "Validation AUROC unavailable (e.g., missing class in val split); "
-                    "temporarily falling back to -val_loss for checkpoint selection."
+        try:
+            for epoch in range(start_epoch, self.cfg.training.epochs):
+                train_loss = self.train_one_epoch(epoch)
+                val_metrics = self.evaluate(self.val_loader, "Validation")
+                metrics = {"val": val_metrics, "train_loss": train_loss}
+                prio, comp, disp = self._selection_candidate(val_metrics, selection_metric)
+                if selection_metric == "val_auroc" and prio == 0 and not warned_auroc_fallback and self.rank == 0:
+                    self.logger.warning(
+                        "Validation AUROC unavailable (e.g., missing class in val split); "
+                        "temporarily falling back to -val_loss for checkpoint selection."
+                    )
+                    warned_auroc_fallback = True
+                cand_key = (prio, comp)
+                is_best = cand_key > best_key
+                if is_best:
+                    best_key = cand_key
+                    best_display = disp
+                best_is_fallback = (best_key[0] == 0)
+                self.save(
+                    epoch,
+                    metrics,
+                    is_best=is_best,
+                    best_score=best_display,
+                    selection_metric=selection_metric,
+                    best_is_fallback=best_is_fallback,
                 )
-                warned_auroc_fallback = True
-            cand_key = (prio, comp)
-            is_best = cand_key > best_key
-            if is_best:
-                best_key = cand_key
-                best_display = disp
-            best_is_fallback = (best_key[0] == 0)
-            self.save(
-                epoch,
-                metrics,
-                is_best=is_best,
-                best_score=best_display,
-                selection_metric=selection_metric,
-                best_is_fallback=best_is_fallback,
-            )
-            if self.rank == 0:
-                self.logger.info(
-                    "Epoch %d done train=%.6f val_loss=%.6f val_auroc=%s %s best=%s",
-                    epoch + 1,
-                    train_loss,
-                    float(val_metrics.get("loss", float("nan"))),
-                    val_metrics.get("auroc"),
-                    selection_metric,
-                    best_display,
-                )
-        if self.test_loader is not None:
-            self._load_best_for_test()
-            test_metrics = self.evaluate(self.test_loader, "Test")
-            self._save_test_metrics(test_metrics)
+                if self.rank == 0:
+                    self.logger.info(
+                        "Epoch %d done train=%.6f val_loss=%.6f val_auroc=%s %s best=%s",
+                        epoch + 1,
+                        train_loss,
+                        float(val_metrics.get("loss", float("nan"))),
+                        val_metrics.get("auroc"),
+                        selection_metric,
+                        best_display,
+                    )
+            if self.test_loader is not None:
+                self._wait_for_save()
+                self._load_best_for_test()
+                test_metrics = self.evaluate(self.test_loader, "Test")
+                self._save_test_metrics(test_metrics)
+        finally:
+            self._wait_for_save()

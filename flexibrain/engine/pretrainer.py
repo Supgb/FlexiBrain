@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
+import threading
+from typing import Optional
 
 import torch
 import torch.optim as optim
@@ -16,6 +19,28 @@ from flexibrain.utils.seed import set_seed
 from flexibrain.utils.training import get_dynamic_momentum, update_ema
 
 
+def _to_cpu_snapshot(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone() if value.device.type == "cpu" else value.detach().cpu()
+    if isinstance(value, dict):
+        return {k: _to_cpu_snapshot(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_to_cpu_snapshot(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_to_cpu_snapshot(v) for v in value)
+    return value
+
+
+def _write_checkpoint(payload: dict, latest_path: str, best_path: Optional[str]) -> None:
+    latest_tmp = f"{latest_path}.{os.getpid()}.tmp"
+    torch.save(payload, latest_tmp)
+    os.replace(latest_tmp, latest_path)
+    if best_path is not None:
+        best_tmp = f"{best_path}.{os.getpid()}.tmp"
+        shutil.copyfile(latest_path, best_tmp)
+        os.replace(best_tmp, best_path)
+
+
 class Pretrainer:
     def __init__(self, cfg: RunConfig):
         self.cfg = cfg
@@ -25,6 +50,13 @@ class Pretrainer:
             setup_distributed(self.rank, self.world_size)
         self.device = torch.device(f"cuda:{self.rank}" if torch.cuda.is_available() else "cpu")
         self.logger = setup_logger("pretrain", cfg.logging.log_dir, rank=self.rank)
+        self._save_thread: Optional[threading.Thread] = None
+
+    def _wait_for_save(self) -> None:
+        thread = getattr(self, "_save_thread", None)
+        if thread is not None:
+            thread.join()
+            self._save_thread = None
 
     def build(self):
         set_seed(self.cfg.training.seed)
@@ -35,6 +67,7 @@ class Pretrainer:
             lr=self.cfg.training.lr,
             betas=(0.9, 0.999),
             weight_decay=self.cfg.training.weight_decay,
+            fused=(self.device.type == "cuda"),
         )
         self.use_amp = bool(self.cfg.training.use_amp and self.device.type == "cuda")
         self.amp_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[self.cfg.training.amp_dtype]
@@ -69,7 +102,7 @@ class Pretrainer:
 
     def train_one_epoch(self, epoch: int) -> float:
         self.model.train()
-        total_loss = 0.0
+        total_loss = torch.zeros((), device=self.device, dtype=torch.float64)
         num_batches = 0
         accumulation_steps = max(1, int(self.cfg.training.grad_accumulation_steps))
         momentum = get_dynamic_momentum(
@@ -85,38 +118,40 @@ class Pretrainer:
             with torch.autocast(device_type=self.device.type, dtype=getattr(self, "amp_dtype", torch.float16), enabled=self.use_amp):
                 loss, _, _, _ = self.model(x, mask_ratio=self.cfg.training.mask_ratio, meta=meta, orig_Ts=orig_Ts, affines=affines)
             self.scaler.scale(loss / accumulation_steps).backward()
-            total_loss += float(loss.item())
+            total_loss += loss.detach().to(torch.float64)
             num_batches += 1
             if (batch_idx + 1) % accumulation_steps == 0:
                 self._optimizer_step(momentum)
             if self.rank == 0 and (batch_idx + 1) % self.cfg.logging.log_interval == 0:
                 current_lr = self.optimizer.param_groups[0]["lr"]
+                loss_val = float(loss.detach().item())
+                avg_val = float(total_loss.item()) / num_batches
                 self.logger.info(
                     "Epoch %d [%d/%d] loss=%.6f avg=%.6f lr=%.3e momentum=%.6f",
                     epoch + 1,
                     batch_idx + 1,
                     len(self.train_loader),
-                    loss.item(),
-                    total_loss / num_batches,
+                    loss_val,
+                    avg_val,
                     current_lr,
                     momentum,
                 )
         if num_batches % accumulation_steps != 0:
             self._optimizer_step(momentum)
-        return total_loss / max(1, num_batches)
+        return float(total_loss.item()) / max(1, num_batches)
 
     @torch.no_grad()
     def validate(self, epoch: int) -> float:
         self.model.eval()
-        total_loss = 0.0
+        total_loss = torch.zeros((), device=self.device, dtype=torch.float64)
         num_batches = 0
         for batch in self.val_loader:
             x, meta, orig_Ts, affines = prepare_batch_data(batch, self.device)
             with torch.autocast(device_type=self.device.type, dtype=getattr(self, "amp_dtype", torch.float16), enabled=self.use_amp):
                 loss, _, _, _ = self.model(x, mask_ratio=self.cfg.training.mask_ratio, meta=meta, orig_Ts=orig_Ts, affines=affines)
-            total_loss += float(loss.item())
+            total_loss += loss.detach().to(torch.float64)
             num_batches += 1
-        avg = total_loss / max(1, num_batches)
+        avg = float(total_loss.item()) / max(1, num_batches)
         if self.rank == 0:
             self.logger.info("Epoch %d validation loss=%.6f", epoch + 1, avg)
         return avg
@@ -135,9 +170,19 @@ class Pretrainer:
             "best_loss": best_loss,
             "config": vars(self.cfg.model),
         }
-        torch.save(payload, os.path.join(self.cfg.logging.checkpoint_dir, "checkpoint_latest.pt"))
-        if is_best:
-            torch.save(payload, os.path.join(self.cfg.logging.checkpoint_dir, "checkpoint_best.pt"))
+        latest_path = os.path.join(self.cfg.logging.checkpoint_dir, "checkpoint_latest.pt")
+        best_path = os.path.join(self.cfg.logging.checkpoint_dir, "checkpoint_best.pt") if is_best else None
+        if getattr(self.cfg.logging, "async_checkpoint", False):
+            self._wait_for_save()
+            cpu_payload = _to_cpu_snapshot(payload)
+            self._save_thread = threading.Thread(
+                target=_write_checkpoint,
+                args=(cpu_payload, latest_path, best_path),
+                daemon=True,
+            )
+            self._save_thread.start()
+        else:
+            _write_checkpoint(payload, latest_path, best_path)
 
     def _resume(self) -> tuple[int, float]:
         path = self.cfg.logging.resume
@@ -162,16 +207,19 @@ class Pretrainer:
         best_loss = float("inf")
         if self.cfg.logging.resume:
             start_epoch, best_loss = self._resume()
-        for epoch in range(start_epoch, self.cfg.training.epochs):
-            if hasattr(self.train_loader.sampler, "set_epoch"):
-                self.train_loader.sampler.set_epoch(epoch)
-            train_loss = self.train_one_epoch(epoch)
-            val_loss = self.validate(epoch)
-            is_best = val_loss < best_loss
-            if is_best:
-                best_loss = val_loss
-            self.save(epoch, val_loss, best_loss, is_best=is_best)
-            if self.rank == 0:
-                self.logger.info("Epoch %d done train=%.6f val=%.6f best=%.6f", epoch + 1, train_loss, val_loss, best_loss)
+        try:
+            for epoch in range(start_epoch, self.cfg.training.epochs):
+                if hasattr(self.train_loader.sampler, "set_epoch"):
+                    self.train_loader.sampler.set_epoch(epoch)
+                train_loss = self.train_one_epoch(epoch)
+                val_loss = self.validate(epoch)
+                is_best = val_loss < best_loss
+                if is_best:
+                    best_loss = val_loss
+                self.save(epoch, val_loss, best_loss, is_best=is_best)
+                if self.rank == 0:
+                    self.logger.info("Epoch %d done train=%.6f val=%.6f best=%.6f", epoch + 1, train_loss, val_loss, best_loss)
+        finally:
+            self._wait_for_save()
         if self.world_size > 1:
             cleanup_distributed()

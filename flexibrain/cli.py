@@ -18,6 +18,12 @@ def _add_common(parser):
     parser.add_argument("--test-list", default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--prefetch-factor", type=int, default=None)
+    parser.add_argument("--persistent-workers", action="store_true", default=None)
+    parser.add_argument("--no-persistent-workers", dest="persistent_workers", action="store_false")
+    parser.add_argument("--temporal-fold", action="store_true", default=None)
+    parser.add_argument("--no-temporal-fold", dest="temporal_fold", action="store_false")
+    parser.add_argument("--folded-cache-dir", default=None)
     parser.add_argument("--t-prime", type=int, default=None)
     parser.add_argument("--tau-seconds", type=float, default=None)
     parser.add_argument("--default-tr", type=float, default=None, help="Fallback TR in seconds when a NIfTI header has no valid TR.")
@@ -30,6 +36,8 @@ def _add_common(parser):
     parser.add_argument("--log-interval", type=int, default=None)
     parser.add_argument("--checkpoint-dir", default=None)
     parser.add_argument("--log-dir", default=None)
+    parser.add_argument("--async-checkpoint", action="store_true", default=None)
+    parser.add_argument("--no-async-checkpoint", dest="async_checkpoint", action="store_false")
     parser.add_argument("--local-rank", type=int, default=None)
     parser.add_argument("--world-size", type=int, default=None)
     parser.add_argument("--use-amp", action="store_true", default=None)
@@ -55,11 +63,11 @@ def _add_model(parser):
 
 
 def apply_common(cfg, args):
-    for key in ["train_list", "val_list", "test_list", "batch_size", "num_workers", "epochs", "lr", "weight_decay", "warmup_epochs", "grad_accumulation_steps", "seed", "local_rank", "world_size"]:
+    for key in ["train_list", "val_list", "test_list", "batch_size", "num_workers", "prefetch_factor", "persistent_workers", "temporal_fold", "folded_cache_dir", "epochs", "lr", "weight_decay", "warmup_epochs", "grad_accumulation_steps", "seed", "local_rank", "world_size"]:
         value = getattr(args, key, None)
         if value is None:
             continue
-        target = cfg.data if key in {"train_list", "val_list", "test_list", "batch_size", "num_workers"} else cfg.training
+        target = cfg.data if key in {"train_list", "val_list", "test_list", "batch_size", "num_workers", "prefetch_factor", "persistent_workers", "temporal_fold", "folded_cache_dir"} else cfg.training
         setattr(target, key, value)
     if args.t_prime is not None:
         cfg.data.T_prime = args.t_prime
@@ -77,6 +85,8 @@ def apply_common(cfg, args):
         cfg.logging.checkpoint_dir = args.checkpoint_dir
     if args.log_dir is not None:
         cfg.logging.log_dir = args.log_dir
+    if args.async_checkpoint is not None:
+        cfg.logging.async_checkpoint = args.async_checkpoint
 
 
 def apply_model(cfg, args):

@@ -1,7 +1,11 @@
 from __future__ import annotations
-import os
 import glob
+import hashlib
+import io
+import os
 import random
+import struct
+import threading
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -221,6 +225,252 @@ def _load_nifti(
         return None, None, None
 
 
+_FOLDED_CACHE_MAGIC = b"FBFOLD01"
+_FOLDED_CACHE_HEADER = struct.Struct("<8s5I4d16f")
+
+
+def _read_exact_into(fileobj, mv: memoryview) -> None:
+    offset = 0
+    total = len(mv)
+    while offset < total:
+        n = fileobj.readinto(mv[offset:])
+        if n is None or n == 0:
+            raise EOFError(f"Unexpected EOF after {offset}/{total} bytes")
+        offset += n
+
+
+def _fold_4d_array(data: np.ndarray, kt: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Fold (X, Y, Z, T) volume into (kt, Z, Y, X) float32 sum and (Z, Y, X) bool mask."""
+    if data.ndim < 4:
+        data = data[..., None]
+    X, Y, Z, T_sel = (int(d) for d in data.shape[:4])
+    folded = np.zeros((kt, Z, Y, X), dtype=np.float32)
+    nonzero = np.zeros((Z, Y, X), dtype=bool)
+    if T_sel <= 0:
+        return folded, nonzero
+
+    data_tzyx = np.ascontiguousarray(data.transpose(3, 2, 1, 0), dtype=np.float32)
+    full_w = T_sel // kt
+    rem = T_sel % kt
+    if full_w > 0:
+        folded += data_tzyx[:full_w * kt].reshape(full_w, kt, Z, Y, X).sum(axis=0, dtype=np.float32)
+    if rem > 0:
+        folded[:rem] += data_tzyx[full_w * kt:]
+    nonzero = np.any(data_tzyx != 0, axis=0)
+    return folded, nonzero
+
+
+def _is_fast_streamable_nifti1(header: nib.nifti1.Nifti1Header) -> bool:
+    if header.endianness != "<" or header.get_data_dtype() != np.dtype("<f4"):
+        return False
+    shape = header.get_data_shape()
+    if len(shape) != 4:
+        return False
+    if int(header["vox_offset"]) < 348:
+        return False
+    slope = float(header["scl_slope"])
+    inter = float(header["scl_inter"])
+    slope_ok = np.isnan(slope) or slope in (0.0, 1.0)
+    inter_ok = np.isnan(inter) or inter == 0.0
+    return slope_ok and inter_ok
+
+
+def _load_nifti_folded(
+    path: Union[str, Path],
+    mmap: bool = True,
+    select_fn: Optional[Callable[[nib.nifti1.Nifti1Header], Tuple[Tuple[float, float, float], float, int, int]]] = None,
+    reuse_bufs: Optional[Dict[int, bytearray]] = None,
+) -> Tuple[
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    Optional[nib.nifti1.Nifti1Header],
+    Optional[Tuple[float, float, float]],
+    Optional[float],
+    Optional[int],
+    Optional[int],
+]:
+    path_str = str(path)
+    is_gz = path_str.lower().endswith(".gz")
+    if (not is_gz) or (_igzip is not None):
+        opener = (lambda p: _igzip.open(p, "rb")) if is_gz else (lambda p: open(p, "rb"))
+        fallback_to_nib = False
+        try:
+            with opener(path_str) as f:
+                hdr_buf = bytearray(348)
+                try:
+                    _read_exact_into(f, memoryview(hdr_buf))
+                except EOFError:
+                    fallback_to_nib = True
+                if not fallback_to_nib:
+                    if int.from_bytes(hdr_buf[:4], "little") != 348:
+                        fallback_to_nib = True
+                    else:
+                        try:
+                            header = nib.Nifti1Header.from_fileobj(io.BytesIO(hdr_buf))
+                        except Exception:
+                            fallback_to_nib = True
+                        if not fallback_to_nib and not _is_fast_streamable_nifti1(header):
+                            fallback_to_nib = True
+
+                if not fallback_to_nib:
+                    # Run metadata/frame validation outside the I/O handler so config errors propagate.
+                    assert select_fn is not None
+                    voxel, tr, t_sel, kt = select_fn(header)
+                    try:
+                        vox_offset = int(header["vox_offset"])
+                        if vox_offset > 348:
+                            skip = bytearray(vox_offset - 348)
+                            _read_exact_into(f, memoryview(skip))
+                        shape = header.get_data_shape()
+                        X, Y, Z = int(shape[0]), int(shape[1]), int(shape[2])
+                        frame_elems = X * Y * Z
+                        frame_bytes = frame_elems * 4
+
+                        folded = np.zeros((kt, Z, Y, X), dtype=np.float32)
+                        nonzero = np.zeros((Z, Y, X), dtype=bool)
+
+                        buf_size = kt * frame_bytes
+                        win_buf = reuse_bufs.get(buf_size) if reuse_bufs is not None else None
+                        if win_buf is None:
+                            win_buf = bytearray(buf_size)
+                            if reuse_bufs is not None:
+                                reuse_bufs[buf_size] = win_buf
+                        win_mv = memoryview(win_buf)
+                        win_arr = np.frombuffer(win_buf, dtype="<f4").reshape(kt, Z, Y, X)
+
+                        full_w = t_sel // kt
+                        rem = t_sel % kt
+                        for _ in range(full_w):
+                            _read_exact_into(f, win_mv)
+                            folded += win_arr
+                            nonzero |= (win_arr != 0).any(axis=0)
+                        if rem > 0:
+                            _read_exact_into(f, win_mv[:rem * frame_bytes])
+                            rem_arr = np.frombuffer(win_buf, dtype="<f4", count=rem * frame_elems).reshape(rem, Z, Y, X)
+                            folded[:rem] += rem_arr
+                            nonzero |= (rem_arr != 0).any(axis=0)
+
+                        affine = header.get_best_affine().astype(np.float32)
+                        return folded, nonzero, affine, header, voxel, tr, t_sel, kt
+                    except (OSError, EOFError, ValueError):
+                        return None, None, None, None, None, None, None, None
+        except OSError:
+            return None, None, None, None, None, None, None, None
+        if not fallback_to_nib:
+            return None, None, None, None, None, None, None, None
+
+    resolved_meta: Dict[str, object] = {}
+
+    def _max_frames_cb(hdr: nib.nifti1.Nifti1Header) -> Optional[int]:
+        assert select_fn is not None
+        voxel_v, tr_v, t_sel_v, kt_v = select_fn(hdr)
+        resolved_meta["voxel"] = voxel_v
+        resolved_meta["tr"] = tr_v
+        resolved_meta["T_selected"] = t_sel_v
+        resolved_meta["kt"] = kt_v
+        shape = hdr.get_data_shape()
+        t_total = int(shape[3]) if len(shape) >= 4 else 1
+        return t_sel_v if (len(shape) >= 4 and t_sel_v < t_total) else None
+
+    data, affine, header = _load_nifti(path_str, mmap=mmap, max_frames_fn=_max_frames_cb)
+    if data is None:
+        return None, None, None, None, None, None, None, None
+
+    voxel = resolved_meta["voxel"]  # type: ignore[assignment]
+    tr = float(resolved_meta["tr"])  # type: ignore[arg-type]
+    t_sel = int(resolved_meta["T_selected"])  # type: ignore[arg-type]
+    kt = int(resolved_meta["kt"])  # type: ignore[arg-type]
+    if data.ndim >= 4 and t_sel < data.shape[3]:
+        data = data[..., :t_sel]
+    folded, nonzero = _fold_4d_array(data, kt)
+    return folded, nonzero, affine.astype(np.float32), header, voxel, tr, t_sel, kt
+
+
+def _folded_cache_key(
+    path: Path,
+    t_prime: Optional[int],
+    tau_seconds: float,
+    default_tr: Optional[float],
+) -> str:
+    st = path.stat()
+    raw = f"{path}|{st.st_size}|{st.st_mtime_ns}|{t_prime}|{tau_seconds}|{default_tr}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def _read_folded_cache(cache_path: Path):
+    try:
+        file_size = cache_path.stat().st_size
+        if file_size < _FOLDED_CACHE_HEADER.size:
+            return None
+        with open(cache_path, "rb") as f:
+            hdr_buf = bytearray(_FOLDED_CACHE_HEADER.size)
+            _read_exact_into(f, memoryview(hdr_buf))
+            unpacked = _FOLDED_CACHE_HEADER.unpack(hdr_buf)
+            magic = unpacked[0]
+            if magic != _FOLDED_CACHE_MAGIC:
+                return None
+            kt, Z, Y, X, t_sel = unpacked[1:6]
+            tr, vx, vy, vz = unpacked[6:10]
+            affine_vals = unpacked[10:26]
+            folded_bytes = kt * Z * Y * X * 4
+            nz_bytes = Z * Y * X
+            if file_size != _FOLDED_CACHE_HEADER.size + folded_bytes + nz_bytes:
+                return None
+            folded_buf = bytearray(folded_bytes)
+            nz_buf = bytearray(nz_bytes)
+            _read_exact_into(f, memoryview(folded_buf))
+            _read_exact_into(f, memoryview(nz_buf))
+        folded = np.frombuffer(folded_buf, dtype=np.float32).reshape(kt, Z, Y, X)
+        nonzero = np.frombuffer(nz_buf, dtype=bool).reshape(Z, Y, X)
+        affine = np.asarray(affine_vals, dtype=np.float32).reshape(4, 4)
+        return folded, nonzero, affine, (float(vx), float(vy), float(vz)), float(tr), int(t_sel), int(kt)
+    except (OSError, EOFError, struct.error, ValueError):
+        return None
+
+
+def _write_folded_cache(
+    cache_path: Path,
+    folded: np.ndarray,
+    nonzero: np.ndarray,
+    affine: np.ndarray,
+    voxel: Tuple[float, float, float],
+    tr: float,
+    t_sel: int,
+    kt: int,
+) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    Z, Y, X = (int(d) for d in nonzero.shape)
+    affine_f32 = np.ascontiguousarray(affine, dtype=np.float32).reshape(-1)
+    hdr_bytes = _FOLDED_CACHE_HEADER.pack(
+        _FOLDED_CACHE_MAGIC,
+        int(kt),
+        Z,
+        Y,
+        X,
+        int(t_sel),
+        float(tr),
+        float(voxel[0]),
+        float(voxel[1]),
+        float(voxel[2]),
+        *[float(v) for v in affine_f32],
+    )
+    folded_c = np.ascontiguousarray(folded, dtype=np.float32)
+    nz_c = np.ascontiguousarray(nonzero, dtype=np.uint8)
+    tmp_path = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(hdr_bytes)
+            f.write(memoryview(folded_c))
+            f.write(memoryview(nz_c))
+        os.replace(tmp_path, cache_path)
+    except OSError:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 class NiftiTxtDataset(Dataset):
     """Dataset that loads NIfTI volumes listed in one or more .txt files.
 
@@ -266,6 +516,8 @@ class NiftiTxtDataset(Dataset):
         T_prime: Optional[int] = None,
         tau_seconds: float = 6.0,
         default_tr: Optional[float] = None,
+        temporal_fold: bool = False,
+        folded_cache_dir: Optional[Union[str, Path]] = None,
     ) -> None:
         super().__init__()
         self.paths: List[Path] = _read_list_files(txt_files)
@@ -280,7 +532,12 @@ class NiftiTxtDataset(Dataset):
         self.default_tr = float(default_tr) if default_tr is not None else None
         if self.default_tr is not None and self.default_tr <= 0:
             raise ValueError("default_tr must be positive when provided")
+        self.temporal_fold = bool(temporal_fold)
+        self.folded_cache_dir = Path(folded_cache_dir) if folded_cache_dir else None
+        if self.folded_cache_dir is not None:
+            self.folded_cache_dir.mkdir(parents=True, exist_ok=True)
         self._meta_cache: Dict[int, Tuple[Tuple[float, float, float], float]] = {}
+        self._reuse_bufs: Dict[int, bytearray] = {}
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -348,6 +605,74 @@ class NiftiTxtDataset(Dataset):
         while attempt < max_attempts:
             current_idx = (idx + attempt) % len(self.paths)
             p = self.paths[current_idx]
+
+            if self.temporal_fold:
+                cache_path: Optional[Path] = None
+                if self.folded_cache_dir is not None:
+                    try:
+                        key = _folded_cache_key(p, self.T_prime, self.tau_seconds, self.default_tr)
+                        cache_path = self.folded_cache_dir / f"{key}.fbc"
+                        cached = _read_folded_cache(cache_path)
+                        if cached is not None:
+                            folded, nonzero, affine, voxel, tr, t_sel, kt = cached
+                            sample = {
+                                "data": torch.from_numpy(folded) if self.return_torch else folded,
+                                "nonzero_mask": torch.from_numpy(nonzero) if self.return_torch else nonzero,
+                                "folded_kt": int(kt),
+                                "affine": torch.from_numpy(affine) if self.return_torch else affine,
+                                "header": None,
+                                "voxel": voxel,
+                                "tr": tr,
+                                "path": p,
+                                "subject_idx": current_idx,
+                                "T_selected": int(t_sel),
+                                "T_prime": self.T_prime,
+                                "tau_seconds": self.tau_seconds,
+                            }
+                            if self.transform is not None:
+                                sample = self.transform(sample)
+                            return sample
+                    except OSError:
+                        cache_path = None
+
+                def _select_folded_params(hdr: nib.nifti1.Nifti1Header) -> Tuple[Tuple[float, float, float], float, int, int]:
+                    voxel_v, tr_v = self._get_meta(current_idx, hdr)
+                    shape = hdr.get_data_shape()
+                    t_total = int(shape[3]) if len(shape) >= 4 else 1
+                    t_sel_v = self._calculate_T_selected(tr_v, t_total)
+                    kt_v = max(1, round(self.tau_seconds / tr_v))
+                    return voxel_v, tr_v, t_sel_v, kt_v
+
+                folded, nonzero, affine, header, voxel, tr, t_sel, kt = _load_nifti_folded(
+                    p,
+                    mmap=self.memory_map,
+                    select_fn=_select_folded_params,
+                    reuse_bufs=self._reuse_bufs,
+                )
+                if folded is not None:
+                    if cache_path is not None:
+                        _write_folded_cache(cache_path, folded, nonzero, affine, voxel, tr, t_sel, kt)
+                    sample = {
+                        "data": torch.from_numpy(folded) if self.return_torch else folded,
+                        "nonzero_mask": torch.from_numpy(nonzero) if self.return_torch else nonzero,
+                        "folded_kt": int(kt),
+                        "affine": torch.from_numpy(affine) if self.return_torch else affine,
+                        "header": header,
+                        "voxel": voxel,
+                        "tr": tr,
+                        "path": p,
+                        "subject_idx": current_idx,
+                        "T_selected": int(t_sel),
+                        "T_prime": self.T_prime,
+                        "tau_seconds": self.tau_seconds,
+                    }
+                    if self.transform is not None:
+                        sample = self.transform(sample)
+                    return sample
+
+                attempt += 1
+                continue
+
             resolved_meta: Dict[str, object] = {}
 
             def _select_frames(hdr: nib.nifti1.Nifti1Header) -> Optional[int]:
